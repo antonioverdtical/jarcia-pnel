@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { LineChart, Line, BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Legend } from "recharts";
+import { obtenerUltimasLecturas, buscarLectura } from "./apiClient";
 
 const DIAS = [
   { key: "L", label: "Lun" },
@@ -412,7 +413,7 @@ function demoLineWeek(baseHour, litrosPorDia) {
 }
 
 function defaultSectors() {
-  const numeros = [1, 2, 3, 4, 5, 6];
+  const numeros = [1, 2, 3, 4, 5, 6, 7, 8];
   // Posiciones calculadas a partir del plano real subido por Antonio
   // (Screenshot_20260820-184239.png): LÍNEA01-04 en la zona grande (49,43 m),
   // LÍNEA05-06 en la zona pequeña (19,38 m). El sensor se coloca a ~50 cm del
@@ -427,6 +428,11 @@ function defaultSectors() {
     4: { tuberia: { x1: 50.4, y1: 27, x2: 96.7, y2: 31 }, sensor: { x: 65, y: 42 }, area: 61.79 },
     5: { tuberia: { x1: 32.5, y1: 56, x2: 69.5, y2: 60 }, sensor: { x: 40, y: 76 }, area: 48.45 },
     6: { tuberia: { x1: 32.5, y1: 66, x2: 69.5, y2: 70 }, sensor: { x: 60, y: 76 }, area: 48.45 },
+    // 7 y 8: posición de plano PROVISIONAL (no viene del plano real subido),
+    // solo para poder probar Zona7/Zona8 localmente — ajustar cuando se
+    // añadan de verdad al panel.
+    7: { tuberia: { x1: 4.2, y1: 36, x2: 50.0, y2: 40 }, sensor: { x: 15, y: 55 }, area: 48.45 },
+    8: { tuberia: { x1: 50.4, y1: 36, x2: 96.7, y2: 40 }, sensor: { x: 85, y: 55 }, area: 48.45 },
   };
   return numeros.map((n, i) => {
     const baseHour = (i * 3) % 24;
@@ -437,7 +443,7 @@ function defaultSectors() {
     const pos = posicionesPlano[n];
     return {
       id: `sector-${n}`,
-      name: `Línea ${n}`,
+      name: `Zona${n}`, // TEMPORAL para probar datos reales — revertir a `Línea ${n}` después
       emitters: 24,
       emitterFlow: 60,
       mode: "horario",
@@ -729,12 +735,42 @@ function fechasMantenimientoDelAnio(fechaInicio, frecuencia) {
 }
 
 const CATALOGO_PROCESOS_MANTENIMIENTO = [
-  { key: "fertilizante", label: "Rellenar fertilizante" },
-  { key: "limpieza_canal", label: "Limpieza de canal" },
-  { key: "cambio_plantas", label: "Cambio de plantas" },
-  { key: "limpieza_plantas", label: "Limpieza de plantas" },
-  { key: "fitosanitario", label: "Tratamiento fitosanitario" },
-  { key: "revision_general", label: "Revisión general del sistema" },
+  {
+    key: "fertilizante",
+    label: "Rellenar fertilizante",
+    detalle:
+      "Se ha revisado y rellenado el depósito de fertirrigación, comprobando la dosificación para asegurar el aporte nutricional correcto de las plantas en las próximas semanas.",
+  },
+  {
+    key: "limpieza_canal",
+    label: "Limpieza de canal",
+    detalle:
+      "Se ha limpiado el canal y los puntos de recogida de agua, retirando hojas, tierra y posibles restos que pudieran obstruir el drenaje de la instalación.",
+  },
+  {
+    key: "cambio_plantas",
+    label: "Cambio de plantas",
+    detalle:
+      "Se han sustituido los ejemplares en mal estado o marchitos por plantas nuevas, manteniendo la densidad y el aspecto visual conjunto del jardín.",
+  },
+  {
+    key: "limpieza_plantas",
+    label: "Limpieza de plantas",
+    detalle:
+      "Se ha realizado limpieza y poda de mantenimiento de la vegetación: retirada de hojas secas, restos vegetales y pequeños ajustes de forma para favorecer un crecimiento sano.",
+  },
+  {
+    key: "fitosanitario",
+    label: "Tratamiento fitosanitario",
+    detalle:
+      "Se ha aplicado un tratamiento fitosanitario a la vegetación, como medida preventiva o correctiva frente a plagas y enfermedades comunes en este tipo de instalación.",
+  },
+  {
+    key: "revision_general",
+    label: "Revisión general del sistema",
+    detalle:
+      "Se ha realizado una revisión completa del sistema de riego: electroválvulas, sensores, presión de red y funcionamiento individual de cada línea, comprobando que todo opera con normalidad.",
+  },
 ];
 
 const CATEGORIAS_ALARMA = [
@@ -1183,7 +1219,8 @@ function SectorCard({ sector, now, mainSupply, maestraCerrada, tecnico, cliente,
   const [flowAnnualOffset, setFlowAnnualOffset] = useState(0);
   const [selectedHourlyDay, setSelectedHourlyDay] = useState(null);
   const [lineAnnualOffset, setLineAnnualOffset] = useState(0);
-  const active = mainSupply && !maestraCerrada && isSectorActiveNow(sector, now);
+  const active =
+    (mainSupply && !maestraCerrada && isSectorActiveNow(sector, now)) || Number(sector.sensors?.flowMeasured || 0) > 0;
   const manualActive = isManualOverrideActive(sector, now);
   const manualRemainingMs = manualActive ? new Date(sector.manualOverride.endsAt).getTime() - now.getTime() : 0;
   const nextEvent = nextEventForSector(sector, now);
@@ -1318,7 +1355,13 @@ function SectorCard({ sector, now, mainSupply, maestraCerrada, tecnico, cliente,
 
   return (
     <div
-      className={sector.blockedByLeak ? "vc-card vc-card-leak" : "vc-card"}
+      className={[
+        "vc-card",
+        sector.blockedByLeak ? "vc-card-leak" : "",
+        editingSchedule ? "vc-card-wide" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
       style={{
         zIndex:
           editingSchedule ||
@@ -2619,6 +2662,11 @@ export default function VerdticalControlPanel() {
   const [proyecto, setProyecto] = useState({ id: "", nombre: "" });
   const [showProyectoConfig, setShowProyectoConfig] = useState(false);
   const [isOnline, setIsOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
+
+  // Últimas lecturas reales del backend (por nombre de línea, ej. "Zona1").
+  // Si una línea no aparece aquí (backend no disponible, o línea sin mapear
+  // a Loxone todavía), se sigue usando la simulación local para ella.
+  const [lecturasReales, setLecturasReales] = useState({});
   // Interruptor SOLO de pruebas: simula que se agota la batería de respaldo
   // del PLC (sin datos en absoluto), sin depender de la conexión real a
   // internet del dispositivo — así se puede probar sin desconectar el wifi.
@@ -2748,6 +2796,10 @@ export default function VerdticalControlPanel() {
   const [firmaFecha, setFirmaFecha] = useState(null);
   const firmaCanvasRef = useRef(null);
   const firmaDibujandoRef = useRef(false);
+  const [firmaClienteDataUrl, setFirmaClienteDataUrl] = useState(null);
+  const [firmaClienteFecha, setFirmaClienteFecha] = useState(null);
+  const firmaClienteCanvasRef = useRef(null);
+  const firmaClienteDibujandoRef = useRef(false);
   const duracionTandaDropdownRef = useRef(null);
   const pruebasDropdownRef = useRef(null);
   const [showUtilidadesBox, setShowUtilidadesBox] = useState(false);
@@ -2925,6 +2977,8 @@ export default function VerdticalControlPanel() {
           bateriaBajaAlertadaRef.current = parsed.bateriaBajaAlertada || false;
           setFirmaDataUrl(parsed.firmaDataUrl || null);
           setFirmaFecha(parsed.firmaFecha || null);
+          setFirmaClienteDataUrl(parsed.firmaClienteDataUrl || null);
+          setFirmaClienteFecha(parsed.firmaClienteFecha || null);
           fertilizerAlertedRef.current = parsed.fertilizerAlerted || { bajo: false, agotado: false };
           setPressureDailyHistory(
             parsed.pressureDailyHistory && parsed.pressureDailyHistory.length > 0
@@ -2956,6 +3010,20 @@ export default function VerdticalControlPanel() {
   useEffect(() => {
     const interval = setInterval(() => setNow(new Date()), 15000);
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    let cancelado = false;
+    const actualizar = async () => {
+      const datos = await obtenerUltimasLecturas();
+      if (datos && !cancelado) setLecturasReales(datos);
+    };
+    actualizar();
+    const interval = setInterval(actualizar, 60000);
+    return () => {
+      cancelado = true;
+      clearInterval(interval);
+    };
   }, []);
 
   useEffect(() => {
@@ -3152,6 +3220,8 @@ export default function VerdticalControlPanel() {
             bateriaBajaAlertada: bateriaBajaAlertadaRef.current,
             firmaDataUrl,
             firmaFecha,
+            firmaClienteDataUrl,
+            firmaClienteFecha,
             pressureDailyHistory: pressureDailyHistory.slice(-MAX_DIAS_HISTORICO),
             pressureSumToday: pressureSumTodayRef.current,
             pressureCountToday: pressureCountTodayRef.current,
@@ -3220,6 +3290,8 @@ export default function VerdticalControlPanel() {
     embozoHorasSostenidas,
     firmaDataUrl,
     firmaFecha,
+    firmaClienteDataUrl,
+    firmaClienteFecha,
     pressureDailyHistory,
     pressureOutageLog,
     pressureHourlyHistory,
@@ -3284,7 +3356,11 @@ export default function VerdticalControlPanel() {
       }
       const sConManual = manualOverride === s.manualOverride ? s : { ...s, manualOverride };
 
-      const active = mainSupply && !maestraCerrada && isSectorActiveNow(sConManual, now);
+      // Si hay caudal real (de la última lectura), la línea está regando de
+      // verdad aunque el horario de la demo no lo prevea — el dato real
+      // manda sobre la simulación de horarios.
+      const active =
+        (mainSupply && !maestraCerrada && isSectorActiveNow(sConManual, now)) || Number(s.sensors?.flowMeasured || 0) > 0;
       nextActive[s.id] = active;
       if (active) anyActiveCount += 1;
       const wasActive = prevActiveRef.current[s.id];
@@ -3301,7 +3377,15 @@ export default function VerdticalControlPanel() {
           newEvents.push({ ts: now.toISOString(), text: `${s.name}: válvula cerrada` });
         }
       }
-      let sim = simulateSector(s, active, now.getHours() + now.getMinutes() / 60);
+      const lecturaReal = buscarLectura(lecturasReales, s.name);
+      let sim = lecturaReal
+        ? {
+            humidity: lecturaReal.humidity ?? s.sensors?.humidity ?? 45,
+            ec: lecturaReal.ec ?? s.sensors?.ec ?? 1.8,
+            temperature: lecturaReal.temperature ?? s.sensors?.temperature ?? 21,
+            flowMeasured: lecturaReal.flowMeasured ?? 0,
+          }
+        : simulateSector(s, active, now.getHours() + now.getMinutes() / 60);
 
       const nominalFlow = Number(s.emitters || 0) * Number(s.emitterFlow || 0);
 
@@ -3375,9 +3459,18 @@ export default function VerdticalControlPanel() {
 
       const prevSensors = s.sensors || {};
       const sameDay = prevSensors.lastResetDay === todayStr;
-      const prevLiters = sameDay ? Number(prevSensors.litersToday || 0) : 0;
       const deltaLiters = sim.flowMeasured * (15 / 3600); // caudal L/h -> litros en 15 s
-      const litersToday = Math.round((prevLiters + deltaLiters) * 10) / 10;
+
+      // Litros de hoy: si Loxone nos da el dato ya calculado (Cd del contador
+      // real), se usa directamente — es más fiable que integrar el caudal
+      // nosotros mismos, y no depende de detectar cambios de día a mano.
+      let litersToday;
+      if (lecturaReal?.litrosHoy !== undefined && lecturaReal?.litrosHoy !== null) {
+        litersToday = lecturaReal.litrosHoy;
+      } else {
+        const prevLiters = sameDay ? Number(prevSensors.litersToday || 0) : 0;
+        litersToday = Math.round((prevLiters + deltaLiters) * 10) / 10;
+      }
 
       const horaActual = now.getHours();
       const prevHourly = sameDay && Array.isArray(s.hourlyConsumption) ? s.hourlyConsumption : Array(24).fill(0);
@@ -3617,11 +3710,16 @@ export default function VerdticalControlPanel() {
 
     prevActiveRef.current = nextActive;
     setSectors(updated);
-    const nuevaPresion = clamp(
-      Math.round((2.6 - anyActiveCount * 0.06 + (Math.random() - 0.5) * 0.08) * 100) / 100,
-      0.5,
-      4.5
-    );
+    // La presión de red es un único sensor físico compartido por toda la
+    // instalación (antes del colector), así que cualquier línea con lectura
+    // real de presión sirve como representante — todas deberían coincidir.
+    const presionRealDisponible = Object.values(lecturasReales || {}).find(
+      (l) => l.presion !== null && l.presion !== undefined
+    )?.presion;
+    const nuevaPresion =
+      presionRealDisponible !== undefined
+        ? Math.round(presionRealDisponible * 100) / 100
+        : clamp(Math.round((2.6 - anyActiveCount * 0.06 + (Math.random() - 0.5) * 0.08) * 100) / 100, 0.5, 4.5);
     setPressureBar(nuevaPresion);
 
     // Caudal medido en el caudalímetro GENERAL, antes de todas las
@@ -4060,7 +4158,7 @@ export default function VerdticalControlPanel() {
       setHistory((h) => [{ ts: now.toISOString(), text: `Aviso: nivel de fertilizante bajo (${nuevoNivel}%).` }, ...h].slice(0, 20));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [now]);
+  }, [now, lecturasReales]);
 
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmProgramarAuto, setConfirmProgramarAuto] = useState(false);
@@ -4068,8 +4166,13 @@ export default function VerdticalControlPanel() {
   const [confirmMantenimientoRealizado, setConfirmMantenimientoRealizado] = useState(false);
   const [showCalendarioMantenimiento, setShowCalendarioMantenimiento] = useState(false);
   // Coordenadas del puntero (ratón o dedo) relativas al lienzo de firma.
-  const posicionFirma = (e) => {
-    const canvas = firmaCanvasRef.current;
+  // Funciones "factoría" de firma: reciben el lienzo (canvas) y la
+  // referencia de "estoy dibujando" correspondientes, y devuelven los
+  // manejadores ya enganchados a ese lienzo — así la misma lógica sirve
+  // tanto para la firma del técnico como para la del cliente, sin duplicar
+  // el código de dibujo dos veces.
+  const posicionFirmaEn = (canvasRef, e) => {
+    const canvas = canvasRef.current;
     const rect = canvas.getBoundingClientRect();
     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
     const clientY = e.touches ? e.touches[0].clientY : e.clientY;
@@ -4078,46 +4181,55 @@ export default function VerdticalControlPanel() {
       y: ((clientY - rect.top) / rect.height) * canvas.height,
     };
   };
-  const firmaEmpezarTrazo = (e) => {
-    e.preventDefault();
-    const canvas = firmaCanvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    const { x, y } = posicionFirma(e);
-    firmaDibujandoRef.current = true;
-    ctx.beginPath();
-    ctx.moveTo(x, y);
-  };
-  const firmaContinuarTrazo = (e) => {
-    if (!firmaDibujandoRef.current) return;
-    e.preventDefault();
-    const canvas = firmaCanvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    const { x, y } = posicionFirma(e);
-    ctx.lineWidth = 2.5;
-    ctx.lineCap = "round";
-    ctx.strokeStyle = "#1a1a1a";
-    ctx.lineTo(x, y);
-    ctx.stroke();
-  };
-  const firmaTerminarTrazo = () => {
-    firmaDibujandoRef.current = false;
-  };
-  const firmaBorrar = () => {
-    const canvas = firmaCanvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-  };
-  const firmaGuardar = () => {
-    const canvas = firmaCanvasRef.current;
-    if (!canvas) return;
-    setFirmaDataUrl(canvas.toDataURL("image/png"));
-    setFirmaFecha(new Date().toISOString());
-  };
+  const crearManejadoresFirma = (canvasRef, dibujandoRef, setDataUrl, setFecha) => ({
+    empezarTrazo: (e) => {
+      e.preventDefault();
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      const { x, y } = posicionFirmaEn(canvasRef, e);
+      dibujandoRef.current = true;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+    },
+    continuarTrazo: (e) => {
+      if (!dibujandoRef.current) return;
+      e.preventDefault();
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      const { x, y } = posicionFirmaEn(canvasRef, e);
+      ctx.lineWidth = 2.5;
+      ctx.lineCap = "round";
+      ctx.strokeStyle = "#1a1a1a";
+      ctx.lineTo(x, y);
+      ctx.stroke();
+    },
+    terminarTrazo: () => {
+      dibujandoRef.current = false;
+    },
+    borrar: () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    },
+    guardar: () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      setDataUrl(canvas.toDataURL("image/png"));
+      setFecha(new Date().toISOString());
+    },
+  });
+  const firmaTecnico = crearManejadoresFirma(firmaCanvasRef, firmaDibujandoRef, setFirmaDataUrl, setFirmaFecha);
+  const firmaCliente = crearManejadoresFirma(
+    firmaClienteCanvasRef,
+    firmaClienteDibujandoRef,
+    setFirmaClienteDataUrl,
+    setFirmaClienteFecha
+  );
 
   const reiniciarPanel = async () => {
     try {
@@ -4149,14 +4261,18 @@ export default function VerdticalControlPanel() {
     return "█".repeat(llenas) + "░".repeat(ancho - llenas);
   };
 
-  const enviarInformeMantenimientoCliente = () => {
-    if (!cliente.email) return;
+  // Construye el texto del informe de mantenimiento (mismo contenido tanto
+  // para el email como para WhatsApp) — separado del propio envío, para no
+  // repetir la lógica dos veces.
+  const construirTextoInformeMantenimiento = () => {
     const ahora = new Date();
     const fecha = ahora.toLocaleDateString("es-ES", { weekday: "long", day: "2-digit", month: "long", year: "numeric" });
     const mesActual = ahora.getMonth();
     const anioActual = ahora.getFullYear();
     const nombreMes = ahora.toLocaleDateString("es-ES", { month: "long" });
-    const lineasActivas = sectors.filter((s) => isSectorActiveNow(s, now)).length;
+    const lineasActivas = sectors.filter(
+      (s) => isSectorActiveNow(s, now) || Number(s.sensors?.flowMeasured || 0) > 0
+    ).length;
     const alarmasAbiertas = alarmHistory
       .filter((a) => a.type !== "fuga_rearmada" && a.type !== "fallo_electrico_resuelto")
       .slice(0, 10);
@@ -4185,51 +4301,80 @@ export default function VerdticalControlPanel() {
     ) / 10;
     const ultimoRelleno = alarmHistory.find((a) => a.type === "fertilizante_rellenado");
 
-    // Checklist de procesos realizados en esta visita.
+    // Checklist de procesos realizados en esta visita — solo se menciona lo
+    // que SÍ se ha hecho, con una explicación real de en qué consiste cada
+    // trabajo (no solo la etiqueta corta del checklist interno).
     const procesosHechos = CATALOGO_PROCESOS_MANTENIMIENTO.filter((p) => procesosRealizados[p.key]);
-    const procesosPendientes = CATALOGO_PROCESOS_MANTENIMIENTO.filter((p) => !procesosRealizados[p.key]);
 
     const maxConsumoLinea = Math.max(1, ...consumoPorLinea.map((l) => l.litros));
     const nombreMaxLargo = Math.max(8, ...consumoPorLinea.map((l) => l.nombre.length));
 
-    const subject = `Verdtical · Informe de mantenimiento — ${fecha}`;
+    const SEP = "─".repeat(32);
+
+    const frecuenciaLabel = {
+      mensual: "mensual",
+      bimensual: "bimensual (cada 2 meses)",
+      trimestral: "trimestral (cada 3 meses)",
+      cuatrimestral: "cuatrimestral (cada 4 meses)",
+      semestral: "semestral (cada 6 meses)",
+    }[cliente.frecuenciaMantenimiento];
+
+    const subject = `🌿 Verdtical · Informe de mantenimiento — ${fecha}`;
     const bodyLineas = [
+      "🌿 VERDTICAL ECOSISTEMA — INFORME DE MANTENIMIENTO",
+      SEP,
+      "",
       `Estimado/a ${cliente.nombre || "cliente"},`,
       "",
-      "Le enviamos el resumen del estado de su instalación de riego:",
+      "Le enviamos el resumen de la visita de mantenimiento realizada en su instalación de riego, junto con el estado actual del sistema.",
       "",
-      `Fecha del informe: ${fecha}`,
-      `Líneas totales: ${sectors.length}`,
+      SEP,
+      "📋 TRABAJOS REALIZADOS EN ESTA VISITA",
+      SEP,
+      ...(procesosHechos.length
+        ? procesosHechos.flatMap((p) => [`✓ ${p.label}`, `  ${p.detalle}`, ""])
+        : ["No se han registrado trabajos específicos en esta visita.", ""]),
+      notaObservacion ? "📝 Observaciones del técnico:" : "",
+      notaObservacion ? `  ${notaObservacion}` : "",
+      notaObservacion ? "" : "",
+      SEP,
+      "💧 ESTADO ACTUAL DE LA INSTALACIÓN",
+      SEP,
+      `Líneas de riego totales: ${sectors.length}`,
       `Líneas regando en este momento: ${lineasActivas}`,
       `Presión de red: ${pressureBar} bar`,
-      "",
       lineasBloqueadas.length
-        ? `Líneas con incidencia abierta ahora mismo: ${lineasBloqueadas.map((s) => s.name).join(", ")}`
-        : "Sin incidencias abiertas en este momento.",
+        ? `⚠ Incidencia abierta ahora mismo en: ${lineasBloqueadas.map((s) => s.name).join(", ")}`
+        : "✓ Sin incidencias abiertas en este momento.",
       "",
-      `Consumo de agua de ${nombreMes} (por línea):`,
+      SEP,
+      `💦 CONSUMO DE AGUA — ${nombreMes.toUpperCase()}`,
+      SEP,
       ...consumoPorLinea.map(
         (l) => `  ${l.nombre.padEnd(nombreMaxLargo)}  ${barraAscii(l.litros, maxConsumoLinea)}  ${l.litros} L`
       ),
       `  ${"".padEnd(nombreMaxLargo)}  ${"—".repeat(18)}`,
       `  ${"Total".padEnd(nombreMaxLargo)}  ${totalConsumoMes} L`,
       "",
-      "Depósito de fertilizante:",
-      `  Nivel actual   [${barraAscii(fertilizerLevel, 100)}] ${fertilizerLevel}%`,
+      SEP,
+      "🧪 DEPÓSITO DE FERTILIZANTE",
+      SEP,
+      `  Nivel actual     [${barraAscii(fertilizerLevel, 100)}] ${fertilizerLevel}%`,
       `  Consumo ${nombreMes.padEnd(9)} [${barraAscii(totalFertilizanteMes, Math.max(totalFertilizanteMes, 5000))}] ${totalFertilizanteMes} mL`,
       ultimoRelleno
         ? `  Último relleno: ${new Date(ultimoRelleno.ts).toLocaleDateString("es-ES", { day: "2-digit", month: "short", year: "numeric" })}`
         : "  Sin relleno registrado todavía.",
       "",
-      "Procesos realizados en esta visita:",
-      ...(procesosHechos.length ? procesosHechos.map((p) => `  ✓ ${p.label}`) : ["  (ninguno marcado)"]),
-      procesosPendientes.length ? "Procesos NO realizados en esta visita:" : "",
-      ...procesosPendientes.map((p) => `  ✗ ${p.label}`),
-      "",
-      notaObservacion ? "Nota de observación:" : "",
-      notaObservacion ? `  ${notaObservacion}` : "",
-      "",
-      alarmasAbiertas.length ? "Últimas alarmas registradas:" : "",
+      cliente.proximoMantenimiento ? SEP : "",
+      cliente.proximoMantenimiento ? "📅 PRÓXIMA VISITA DE MANTENIMIENTO" : "",
+      cliente.proximoMantenimiento ? SEP : "",
+      cliente.proximoMantenimiento
+        ? `Su próxima visita de mantenimiento está programada para el ${new Date(cliente.proximoMantenimiento).toLocaleDateString("es-ES", { weekday: "long", day: "2-digit", month: "long", year: "numeric" })}${frecuenciaLabel ? ` (frecuencia ${frecuenciaLabel})` : ""}.`
+        : "",
+      cliente.proximoMantenimiento ? "" : "",
+      alarmasAbiertas.length ? SEP : "",
+      alarmasAbiertas.length ? "🔔 HISTORIAL DE AVISOS RECIENTES" : "",
+      alarmasAbiertas.length ? SEP : "",
       ...alarmasAbiertas.map((a) => {
         const t = textoAlarma(a);
         return `  · ${a.lineName || "Sistema"} — ${t.titulo} (${new Date(a.ts).toLocaleDateString("es-ES", { day: "2-digit", month: "short" })})`;
@@ -4240,9 +4385,21 @@ export default function VerdticalControlPanel() {
       "Un saludo,",
       "Equipo Verdtical Ecosistema",
     ].filter((l) => l !== "");
-    const body = bodyLineas.join("\n");
+    return { subject, body: bodyLineas.join("\n") };
+  };
+
+  const enviarInformeMantenimientoCliente = () => {
+    if (!cliente.email) return null;
+    const { subject, body } = construirTextoInformeMantenimiento();
     const destino = cliente.emailAvisos || cliente.email;
     return `mailto:${destino}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  };
+
+  const enviarInformeMantenimientoWhatsapp = () => {
+    if (!cliente.telefono) return null;
+    const { subject, body } = construirTextoInformeMantenimiento();
+    const telefono = cliente.telefono.replace(/[^0-9]/g, "");
+    return `https://wa.me/${telefono}?text=${encodeURIComponent(`${subject}\n\n${body}`)}`;
   };
 
   const rellenarFertilizante = () => {
@@ -4464,17 +4621,44 @@ export default function VerdticalControlPanel() {
     );
   }
 
-  const anyActive = mainSupply && !maestraCerrada && sectors.some((s) => isSectorActiveNow(s, now));
   const totalFlowMeasured = sectors.reduce((sum, s) => sum + Number(s.sensors?.flowMeasured || 0), 0);
+  const anyActive =
+    (mainSupply && !maestraCerrada && sectors.some((s) => isSectorActiveNow(s, now))) || totalFlowMeasured > 0;
   const pressureOutOfRange = pressureBar < presionBaja || pressureBar > presionAlta;
   const presionEnRangoTrabajo = pressureBar >= 1.8 && pressureBar <= 3.5;
   const todayTotalLiters = Math.round(sectors.reduce((sum, s) => sum + Number(s.sensors?.litersToday || 0), 0));
   // Total consumido desde el inicio: suma de todo el histórico diario
-  // guardado (hasta 365 días) más lo que lleva hoy, que todavía no se ha
-  // cerrado como día completo en dailyConsumption.
-  const totalLitrosHistorico = Math.round(dailyConsumption.reduce((sum, d) => sum + Number(d.liters || 0), 0) + todayTotalLiters);
+  // guardado (hasta 365 días) más lo que lleva hoy. Si hay datos reales de
+  // Loxone, "dailyConsumption" es histórico de la demo (falso) y no debe
+  // mezclarse con el total real de hoy — se muestra solo lo real.
+  const hayDatosRealesHoy = Object.keys(lecturasReales || {}).length > 0;
+  const totalLitrosHistorico = hayDatosRealesHoy
+    ? todayTotalLiters
+    : Math.round(dailyConsumption.reduce((sum, d) => sum + Number(d.liters || 0), 0) + todayTotalLiters);
   const chartConsumoDiario = [...dailyConsumption, { label: "Hoy", liters: todayTotalLiters, isToday: true }];
   const chartConsumoReciente = chartConsumoDiario.slice(-14);
+  // Comparativa mensual: agrupa todo el histórico diario (más lo de hoy) por
+  // mes, sumando los litros de cada uno, para poder comparar un mes con
+  // otro de un vistazo (hasta 12 meses, los más recientes).
+  const chartConsumoMensual = (() => {
+    const porMes = {};
+    chartConsumoDiario.forEach((d) => {
+      const fecha = d.isToday ? now : new Date(d.date);
+      const clave = `${fecha.getFullYear()}-${String(fecha.getMonth() + 1).padStart(2, "0")}`;
+      if (!porMes[clave]) {
+        porMes[clave] = {
+          liters: 0,
+          label: fecha.toLocaleDateString("es-ES", { month: "short", year: "2-digit" }),
+          ordenFecha: fecha,
+        };
+      }
+      porMes[clave].liters += Number(d.liters || 0);
+    });
+    return Object.values(porMes)
+      .sort((a, b) => a.ordenFecha - b.ordenFecha)
+      .slice(-12)
+      .map((m) => ({ label: m.label, liters: Math.round(m.liters * 10) / 10 }));
+  })();
   const promedioPresionHoy =
     pressureCountTodayRef.current > 0
       ? Math.round((pressureSumTodayRef.current / pressureCountTodayRef.current) * 100) / 100
@@ -4642,16 +4826,80 @@ export default function VerdticalControlPanel() {
           font-family: var(--vc-font-mono);
           font-size: 10px;
         }
+        .vc-informe-papel {
+          background: #ffffff;
+          color: #1a2226;
+          border-radius: 6px;
+          padding: 0 0 20px;
+          overflow: hidden;
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
+        }
         .vc-informe-encabezado {
-          background: var(--vc-panel);
-          border: 1px solid var(--vc-border);
-          border-radius: 10px;
-          padding: 12px 14px;
+          background: #374550;
+          color: #ffffff;
+          padding: 22px 22px 16px;
+          margin: -20px -20px 18px;
+          border-bottom: 5px solid #02bea5;
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
+        }
+        .vc-informe-cabecera-marca {
+          font-size: 17px;
+          margin-bottom: 10px;
+        }
+        .vc-informe-marca-fuerte {
+          font-weight: 700;
+          letter-spacing: 0.02em;
+        }
+        .vc-informe-marca-suave {
+          color: #02bea5;
+          font-weight: 500;
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
+        }
+        .vc-informe-etiqueta {
+          display: inline-block;
+          background: #02bea5;
+          color: #06342c;
+          font-size: 10px;
+          font-weight: 700;
+          letter-spacing: 0.05em;
+          padding: 3px 10px;
+          border-radius: 3px;
+          margin-bottom: 8px;
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
         }
         .vc-informe-titulo-empresa {
           font-weight: 700;
-          font-size: 14px;
-          margin-bottom: 8px;
+          font-size: 19px;
+          margin-bottom: 10px;
+        }
+        .vc-informe-papel .vc-informe-fila {
+          color: #cfe3e0;
+          font-size: 12px;
+        }
+        .vc-informe-papel .vc-history-title {
+          background: #e9f5f3;
+          color: #02897a;
+          padding: 7px 14px;
+          margin: 18px 20px 10px !important;
+          border-radius: 4px;
+          font-size: 12px;
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+          font-weight: 700;
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
+        }
+        .vc-informe-papel > *:not(.vc-informe-encabezado):not(.vc-history-title) {
+          margin-left: 20px;
+          margin-right: 20px;
+        }
+        .vc-informe-papel .vc-history-empty,
+        .vc-informe-papel .vc-tecnico-hint {
+          color: #5c6b68;
         }
         .vc-informe-resumen {
           display: grid;
@@ -4660,10 +4908,9 @@ export default function VerdticalControlPanel() {
           margin-top: 10px;
         }
         .vc-informe-resumen-stat {
-          background: var(--vc-panel-2);
-          border: 1px solid var(--vc-border);
-          border-radius: 8px;
-          padding: 8px 4px;
+          background: #e9f5f3;
+          border-radius: 6px;
+          padding: 10px 4px;
           text-align: center;
           -webkit-print-color-adjust: exact;
           print-color-adjust: exact;
@@ -4672,10 +4919,11 @@ export default function VerdticalControlPanel() {
           font-family: var(--vc-font-mono);
           font-size: 16px;
           font-weight: 700;
+          color: #02897a;
         }
         .vc-informe-resumen-label {
           font-size: 9px;
-          color: var(--vc-text-muted);
+          color: #4a5a57;
           text-transform: uppercase;
           letter-spacing: 0.03em;
           margin-top: 2px;
@@ -4683,10 +4931,11 @@ export default function VerdticalControlPanel() {
         .vc-informe-incidencias {
           margin-top: 10px;
           font-size: 12px;
-          padding: 8px 10px;
-          border-radius: 8px;
-          background: var(--vc-panel-2);
-          border: 1px solid var(--vc-border);
+          padding: 9px 12px;
+          border-radius: 6px;
+          background: #fef0d9;
+          color: #6b4a10;
+          border-left: 3px solid #e0a458;
           -webkit-print-color-adjust: exact;
           print-color-adjust: exact;
         }
@@ -4701,6 +4950,7 @@ export default function VerdticalControlPanel() {
           align-items: center;
           gap: 8px;
           font-size: 11px;
+          color: #1a2226;
         }
         .vc-informe-consumo-nombre {
           overflow: hidden;
@@ -4708,7 +4958,7 @@ export default function VerdticalControlPanel() {
           white-space: nowrap;
         }
         .vc-informe-consumo-barra-wrap {
-          background: var(--vc-panel-2);
+          background: #e9f5f3;
           border-radius: 4px;
           height: 10px;
           overflow: hidden;
@@ -4716,7 +4966,7 @@ export default function VerdticalControlPanel() {
           print-color-adjust: exact;
         }
         .vc-informe-consumo-barra {
-          background: var(--vc-flow);
+          background: #02bea5;
           height: 100%;
           -webkit-print-color-adjust: exact;
           print-color-adjust: exact;
@@ -4724,10 +4974,53 @@ export default function VerdticalControlPanel() {
         .vc-informe-consumo-valor {
           text-align: right;
           font-family: var(--vc-font-mono);
+          color: #1a2226;
         }
         .vc-informe-fertilizante {
           margin-top: 10px;
           font-size: 12px;
+          color: #1a2226;
+        }
+        .vc-informe-mensual-grafica {
+          display: flex;
+          align-items: flex-end;
+          gap: 4px;
+          height: 100px;
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
+        }
+        .vc-informe-mensual-barra-col {
+          flex: 1;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          height: 100%;
+          justify-content: flex-end;
+        }
+        .vc-informe-mensual-barra-wrap {
+          width: 100%;
+          height: 70px;
+          display: flex;
+          align-items: flex-end;
+        }
+        .vc-informe-mensual-barra {
+          width: 100%;
+          background: #02bea5;
+          border-radius: 3px 3px 0 0;
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
+        }
+        .vc-informe-mensual-valor {
+          font-size: 8px;
+          font-family: var(--vc-font-mono);
+          color: #4a5a57;
+          margin-top: 3px;
+        }
+        .vc-informe-mensual-label {
+          font-size: 9px;
+          color: #1a2226;
+          text-transform: capitalize;
+          margin-top: 1px;
         }
         .vc-informe-fila {
           display: flex;
@@ -4738,14 +5031,19 @@ export default function VerdticalControlPanel() {
           margin-bottom: 4px;
         }
         .vc-informe-procesos {
-          background: var(--vc-panel);
-          border: 1px solid var(--vc-border);
-          border-radius: 10px;
+          background: #e9f5f3;
+          border-radius: 6px;
           padding: 10px 14px;
+          color: #1a2226;
           font-size: 12px;
           display: flex;
           flex-direction: column;
           gap: 4px;
+        }
+        .vc-informe-firmas-doble {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 16px;
         }
         .vc-firma-wrap {
           background: #fff;
@@ -4758,7 +5056,7 @@ export default function VerdticalControlPanel() {
         .vc-firma-canvas {
           width: 100%;
           max-width: 500px;
-          height: 200px;
+          height: 130px;
           touch-action: none;
           cursor: crosshair;
           border-radius: 8px;
@@ -5775,6 +6073,9 @@ export default function VerdticalControlPanel() {
           border: 2px solid var(--vc-red);
           background: linear-gradient(180deg, #3a1616 0%, var(--vc-panel) 90px);
         }
+        .vc-card-wide {
+          grid-column: 1 / -1;
+        }
         .vc-card-top {
           display: flex;
           justify-content: space-between;
@@ -6131,8 +6432,6 @@ export default function VerdticalControlPanel() {
           display: flex;
           flex-direction: column;
           gap: 10px;
-          max-height: 420px;
-          overflow-y: auto;
         }
         .vc-auto-programa {
           background: var(--vc-panel-2);
@@ -6472,6 +6771,10 @@ export default function VerdticalControlPanel() {
           color: var(--vc-text-muted);
           cursor: not-allowed;
         }
+        .vc-informe-whatsapp-btn {
+          background: #25d366;
+          color: #04160c;
+        }
         .vc-cliente-copiar-btn {
           background: transparent;
           border: 1px dashed var(--vc-border);
@@ -6657,6 +6960,7 @@ export default function VerdticalControlPanel() {
           .vc-charts-row { grid-template-columns: 1fr; }
           .vc-summary-row { grid-template-columns: repeat(2, 1fr); }
           .vc-summary-row-3 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+          .vc-informe-firmas-doble { grid-template-columns: 1fr; }
           .vc-informe-resumen { grid-template-columns: repeat(2, 1fr); }
           .vc-top-buttons {
             display: grid;
@@ -7394,7 +7698,10 @@ export default function VerdticalControlPanel() {
             <div className="vc-summary-icon-box">
               <FertilizerGauge
                 level={fertilizerLevel}
-                consumiendo={mainSupply && !maestraCerrada && sectors.some((s) => isSectorActiveNow(s, now))}
+                consumiendo={
+                  (mainSupply && !maestraCerrada && sectors.some((s) => isSectorActiveNow(s, now))) ||
+                  sectors.some((s) => Number(s.sensors?.flowMeasured || 0) > 0)
+                }
               />
             </div>
             <div className="vc-summary-text vc-summary-text-center">
@@ -7810,15 +8117,28 @@ export default function VerdticalControlPanel() {
               // firma guardada si ya había una.
               setTimeout(() => {
                 const canvas = firmaCanvasRef.current;
-                if (!canvas) return;
-                const ctx = canvas.getContext("2d");
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
-                ctx.fillStyle = "#ffffff";
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
-                if (firmaDataUrl) {
-                  const img = new Image();
-                  img.onload = () => ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-                  img.src = firmaDataUrl;
+                if (canvas) {
+                  const ctx = canvas.getContext("2d");
+                  ctx.clearRect(0, 0, canvas.width, canvas.height);
+                  ctx.fillStyle = "#ffffff";
+                  ctx.fillRect(0, 0, canvas.width, canvas.height);
+                  if (firmaDataUrl) {
+                    const img = new Image();
+                    img.onload = () => ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                    img.src = firmaDataUrl;
+                  }
+                }
+                const canvasCliente = firmaClienteCanvasRef.current;
+                if (canvasCliente) {
+                  const ctxCliente = canvasCliente.getContext("2d");
+                  ctxCliente.clearRect(0, 0, canvasCliente.width, canvasCliente.height);
+                  ctxCliente.fillStyle = "#ffffff";
+                  ctxCliente.fillRect(0, 0, canvasCliente.width, canvasCliente.height);
+                  if (firmaClienteDataUrl) {
+                    const imgCliente = new Image();
+                    imgCliente.onload = () => ctxCliente.drawImage(imgCliente, 0, 0, canvasCliente.width, canvasCliente.height);
+                    imgCliente.src = firmaClienteDataUrl;
+                  }
                 }
               }, 50);
             }}
@@ -8769,7 +9089,12 @@ export default function VerdticalControlPanel() {
       <>
       <div className="vc-collector-wrap">
         <CollectorFlow
-          lines={sectors.map((s) => ({ name: s.name, active: mainSupply && !maestraCerrada && isSectorActiveNow(s, now) }))}
+          lines={sectors.map((s) => ({
+            name: s.name,
+            active:
+              (mainSupply && !maestraCerrada && isSectorActiveNow(s, now)) ||
+              Number(s.sensors?.flowMeasured || 0) > 0,
+          }))}
         />
       </div>
 
@@ -8842,7 +9167,7 @@ export default function VerdticalControlPanel() {
                 {sectors
                   .filter((s) => s.posicionPlano)
                   .map((s) => {
-                    const activa = isSectorActiveNow(s, now);
+                    const activa = isSectorActiveNow(s, now) || Number(s.sensors?.flowMeasured || 0) > 0;
                     const conAlarma = s.blockedByLeak || s.blockedByFault || s.minorLeakFlag || s.clogFlag;
                     const color = conAlarma ? "var(--vc-red)" : activa ? "var(--vc-flow)" : "var(--vc-brass)";
                     const humedad = s.sensors?.humidity;
@@ -8973,15 +9298,15 @@ export default function VerdticalControlPanel() {
               </div>
             </div>
 
+            <div className="vc-informe-papel">
             <div className="vc-informe-encabezado">
-              <div className="vc-informe-titulo-empresa">Informe de mantenimiento — Verdtical Ecosistema S.L.</div>
-              <div className="vc-informe-fila">
-                <span>
-                  <strong>Proyecto:</strong> {proyecto.nombre || "sin definir"}
-                </span>
-                <span>
-                  <strong>Fecha:</strong> {now.toLocaleDateString("es-ES", { day: "2-digit", month: "long", year: "numeric" })}
-                </span>
+              <div className="vc-informe-cabecera-marca">
+                <span className="vc-informe-marca-fuerte">VERDTICAL</span>{" "}
+                <span className="vc-informe-marca-suave">ECOSISTEMA S.L.</span>
+              </div>
+              <div className="vc-informe-etiqueta">INFORME DE MANTENIMIENTO</div>
+              <div className="vc-informe-titulo-empresa">
+                {proyecto.nombre || "Proyecto sin definir"}
               </div>
               <div className="vc-informe-fila">
                 <span>
@@ -8989,6 +9314,9 @@ export default function VerdticalControlPanel() {
                 </span>
                 <span>
                   <strong>Cliente:</strong> {cliente.nombre || "sin definir"}
+                </span>
+                <span>
+                  <strong>Fecha:</strong> {now.toLocaleDateString("es-ES", { day: "2-digit", month: "long", year: "numeric" })}
                 </span>
               </div>
             </div>
@@ -8998,7 +9326,9 @@ export default function VerdticalControlPanel() {
               const mesActual = ahora.getMonth();
               const anioActual = ahora.getFullYear();
               const nombreMes = ahora.toLocaleDateString("es-ES", { month: "long" });
-              const lineasActivas = sectors.filter((s) => isSectorActiveNow(s, now)).length;
+              const lineasActivas = sectors.filter(
+                (s) => isSectorActiveNow(s, now) || Number(s.sensors?.flowMeasured || 0) > 0
+              ).length;
               const lineasBloqueadas = sectors.filter((s) => s.blockedByLeak || s.blockedByFault);
               const consumoPorLinea = sectors.map((s) => {
                 const diasDelMes = (s.dailyConsumption || []).filter((d) => {
@@ -9068,6 +9398,34 @@ export default function VerdticalControlPanel() {
                   <div className="vc-informe-fertilizante">
                     Fertilizante consumido en {nombreMes}: <strong>{totalFertilizanteMes} mL</strong>
                   </div>
+
+                  {chartConsumoMensual.length > 1 && (
+                    <>
+                      <div className="vc-history-title" style={{ marginTop: 14, marginBottom: 6 }}>
+                        Evolución del consumo — últimos {chartConsumoMensual.length} meses
+                      </div>
+                      <div className="vc-informe-mensual-grafica">
+                        {(() => {
+                          const maxMensual = Math.max(1, ...chartConsumoMensual.map((m) => m.liters));
+                          return chartConsumoMensual.map((m, i) => (
+                            <div className="vc-informe-mensual-barra-col" key={i}>
+                              <div className="vc-informe-mensual-barra-wrap">
+                                <div
+                                  className="vc-informe-mensual-barra"
+                                  style={{ height: `${Math.max(4, (m.liters / maxMensual) * 100)}%` }}
+                                />
+                              </div>
+                              <span className="vc-informe-mensual-valor">{m.liters}</span>
+                              <span className="vc-informe-mensual-label">{m.label}</span>
+                            </div>
+                          ));
+                        })()}
+                      </div>
+                      <p className="vc-tecnico-hint" style={{ marginTop: 6, marginBottom: 0 }}>
+                        Suma de todas las líneas juntas, agrupada por mes (litros).
+                      </p>
+                    </>
+                  )}
                 </>
               );
             })()}
@@ -9087,13 +9445,31 @@ export default function VerdticalControlPanel() {
             </div>
             <div className="vc-informe-procesos vc-informe-solo-print">
               {CATALOGO_PROCESOS_MANTENIMIENTO.filter((p) => procesosRealizados[p.key]).length === 0 ? (
-                <div className="vc-history-empty">no se ha marcado ningún proceso</div>
+                <div className="vc-history-empty">No se han registrado trabajos específicos en esta visita.</div>
               ) : (
                 CATALOGO_PROCESOS_MANTENIMIENTO.filter((p) => procesosRealizados[p.key]).map((p) => (
-                  <div key={p.key}>✓ {p.label}</div>
+                  <div key={p.key} style={{ marginBottom: 8 }}>
+                    <div>✓ {p.label}</div>
+                    <div style={{ fontSize: 10, color: "var(--vc-text-muted)", marginTop: 2 }}>{p.detalle}</div>
+                  </div>
                 ))
               )}
             </div>
+            {cliente.proximoMantenimiento && (
+              <>
+                <div className="vc-history-title vc-informe-solo-print" style={{ marginTop: 14, marginBottom: 4 }}>
+                  Próxima visita de mantenimiento
+                </div>
+                <p className="vc-tecnico-hint vc-informe-solo-print" style={{ marginTop: 0 }}>
+                  {new Date(cliente.proximoMantenimiento).toLocaleDateString("es-ES", {
+                    weekday: "long",
+                    day: "2-digit",
+                    month: "long",
+                    year: "numeric",
+                  })}
+                </p>
+              </>
+            )}
 
             <label className="vc-tecnico-field vc-informe-no-print" style={{ marginTop: 8 }}>
               Nota de observación
@@ -9110,57 +9486,118 @@ export default function VerdticalControlPanel() {
                 <p className="vc-tecnico-hint vc-informe-solo-print" style={{ marginTop: 0 }}>{notaObservacion}</p>
               </>
             )}
-            {cliente.email ? (
-              <a
-                className="vc-cliente-informe-btn vc-informe-no-print"
-                href={enviarInformeMantenimientoCliente()}
-                style={{ textDecoration: "none", display: "inline-block", textAlign: "center" }}
-              >
-                ✉ enviar informe de mantenimiento ahora
-              </a>
-            ) : (
-              <button className="vc-cliente-informe-btn vc-informe-no-print" disabled>
-                ✉ enviar informe de mantenimiento ahora
-              </button>
-            )}
-            {!cliente.email && (
+            <div className="vc-informe-no-print vc-firma-botones" style={{ marginTop: 0 }}>
+              {cliente.email ? (
+                <a
+                  className="vc-cliente-informe-btn"
+                  href={enviarInformeMantenimientoCliente()}
+                  style={{ textDecoration: "none", display: "inline-block", textAlign: "center" }}
+                >
+                  ✉ enviar por email
+                </a>
+              ) : (
+                <button className="vc-cliente-informe-btn" disabled>
+                  ✉ enviar por email
+                </button>
+              )}
+              {cliente.telefono ? (
+                <a
+                  className="vc-cliente-informe-btn vc-informe-whatsapp-btn"
+                  href={enviarInformeMantenimientoWhatsapp()}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{ textDecoration: "none", display: "inline-block", textAlign: "center" }}
+                >
+                  📱 enviar por WhatsApp
+                </a>
+              ) : (
+                <button className="vc-cliente-informe-btn" disabled>
+                  📱 enviar por WhatsApp
+                </button>
+              )}
+            </div>
+            {(!cliente.email || !cliente.telefono) && (
               <p className="vc-tecnico-hint vc-informe-no-print" style={{ margin: 0 }}>
-                añade un email al cliente (en el botón Cliente) para poder enviarlo
+                {!cliente.email && "añade un email al cliente"}
+                {!cliente.email && !cliente.telefono && " y "}
+                {!cliente.telefono && "añade un teléfono al cliente"} (en el botón Cliente) para poder enviarlo por esa vía
               </p>
             )}
 
-            <div className="vc-history-title" style={{ marginTop: 14, marginBottom: 4 }}>Firma del técnico</div>
-            <div className="vc-firma-wrap">
-              <canvas
-                ref={firmaCanvasRef}
-                width={500}
-                height={200}
-                className="vc-firma-canvas"
-                onMouseDown={firmaEmpezarTrazo}
-                onMouseMove={firmaContinuarTrazo}
-                onMouseUp={firmaTerminarTrazo}
-                onMouseLeave={firmaTerminarTrazo}
-                onTouchStart={firmaEmpezarTrazo}
-                onTouchMove={firmaContinuarTrazo}
-                onTouchEnd={firmaTerminarTrazo}
-              />
+            <div className="vc-informe-firmas-doble">
+              <div>
+                <div className="vc-history-title" style={{ marginTop: 14, marginBottom: 4 }}>Firma del técnico</div>
+                <div className="vc-firma-wrap">
+                  <canvas
+                    ref={firmaCanvasRef}
+                    width={500}
+                    height={130}
+                    className="vc-firma-canvas"
+                    onMouseDown={firmaTecnico.empezarTrazo}
+                    onMouseMove={firmaTecnico.continuarTrazo}
+                    onMouseUp={firmaTecnico.terminarTrazo}
+                    onMouseLeave={firmaTecnico.terminarTrazo}
+                    onTouchStart={firmaTecnico.empezarTrazo}
+                    onTouchMove={firmaTecnico.continuarTrazo}
+                    onTouchEnd={firmaTecnico.terminarTrazo}
+                  />
+                </div>
+                <div className="vc-informe-no-print vc-firma-botones">
+                  <button className="vc-toggle-btn" onClick={firmaTecnico.borrar}>
+                    🗑 borrar
+                  </button>
+                  <button className="vc-toggle-btn vc-firma-guardar-btn" onClick={firmaTecnico.guardar}>
+                    ✓ guardar
+                  </button>
+                </div>
+                {firmaFecha && (
+                  <p className="vc-tecnico-hint" style={{ marginTop: 8 }}>
+                    Firmado el {new Date(firmaFecha).toLocaleString("es-ES")}
+                  </p>
+                )}
+              </div>
+              <div>
+                <div className="vc-history-title" style={{ marginTop: 14, marginBottom: 4 }}>Conformidad del cliente</div>
+                <div className="vc-firma-wrap">
+                  <canvas
+                    ref={firmaClienteCanvasRef}
+                    width={500}
+                    height={130}
+                    className="vc-firma-canvas"
+                    onMouseDown={firmaCliente.empezarTrazo}
+                    onMouseMove={firmaCliente.continuarTrazo}
+                    onMouseUp={firmaCliente.terminarTrazo}
+                    onMouseLeave={firmaCliente.terminarTrazo}
+                    onTouchStart={firmaCliente.empezarTrazo}
+                    onTouchMove={firmaCliente.continuarTrazo}
+                    onTouchEnd={firmaCliente.terminarTrazo}
+                  />
+                </div>
+                <div className="vc-informe-no-print vc-firma-botones">
+                  <button className="vc-toggle-btn" onClick={firmaCliente.borrar}>
+                    🗑 borrar
+                  </button>
+                  <button className="vc-toggle-btn vc-firma-guardar-btn" onClick={firmaCliente.guardar}>
+                    ✓ guardar
+                  </button>
+                </div>
+                {firmaClienteFecha && (
+                  <p className="vc-tecnico-hint" style={{ marginTop: 8 }}>
+                    Conforme el {new Date(firmaClienteFecha).toLocaleString("es-ES")}
+                  </p>
+                )}
+              </div>
             </div>
+            <p className="vc-tecnico-hint vc-informe-no-print" style={{ marginTop: 4 }}>
+              Si el cliente está presente, puede firmar directamente aquí, en el mismo dispositivo, para dejar constancia
+              de su conformidad con los trabajos realizados.
+            </p>
             <div className="vc-informe-no-print vc-firma-botones">
-              <button className="vc-toggle-btn" onClick={firmaBorrar}>
-                🗑 borrar firma
-              </button>
-              <button className="vc-toggle-btn vc-firma-guardar-btn" onClick={firmaGuardar}>
-                ✓ guardar firma
-              </button>
               <button className="vc-toggle-btn vc-firma-guardar-btn" onClick={() => window.print()}>
                 🖨️ imprimir / guardar como PDF
               </button>
             </div>
-            {firmaFecha && (
-              <p className="vc-tecnico-hint" style={{ marginTop: 8 }}>
-                Firmado el {new Date(firmaFecha).toLocaleString("es-ES")}
-              </p>
-            )}
+            </div>
         </div>
       )}
 
