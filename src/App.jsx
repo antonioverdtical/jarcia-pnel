@@ -4673,8 +4673,8 @@ export default function VerdticalControlPanel() {
   return (
     <div className="vc-root">
       <style>{`
-        html, body {
-          background: #12201f;
+        html, body, :root {
+          background: #12201f !important;
           margin: 0;
         }
         .vc-root {
