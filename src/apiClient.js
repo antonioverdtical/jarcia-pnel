@@ -22,10 +22,14 @@ export async function obtenerUltimasLecturas() {
     if (!res.ok) return null;
     const filas = await res.json();
 
-    // Indexado por nombre normalizado de línea, para emparejar con sectors.
+    // Indexado por nombre normalizado de línea, para emparejar con sectors,
+    // y también por posición (orden en que vienen del backend, que es el
+    // orden en que se sincronizaron las Zonas reales) — por si los nombres
+    // del panel no coinciden con los del backend (ej. "Línea 1" vs "Zona1").
     const porNombre = {};
+    const porPosicion = [];
     for (const fila of filas) {
-      porNombre[normalizar(fila.nombre)] = {
+      const lectura = {
         humidity: fila.humedad !== null ? Number(fila.humedad) : null,
         temperature: fila.temperatura !== null ? Number(fila.temperatura) : null,
         ec: fila.ce !== null ? Number(fila.ce) : null,
@@ -37,16 +41,23 @@ export async function obtenerUltimasLecturas() {
         presion: fila.presion !== null ? Number(fila.presion) : null,
         medidoEn: fila.medido_en,
       };
+      porNombre[normalizar(fila.nombre)] = lectura;
+      porPosicion.push(lectura);
     }
-    return porNombre;
+    return { porNombre, porPosicion };
   } catch {
     return null;
   }
 }
 
-// Busca la lectura real de un sector del panel por su nombre, tolerando
-// pequeñas diferencias de formato frente al nombre guardado en el backend.
-export function buscarLectura(lecturasReales, nombreSector) {
+// Busca la lectura real de un sector del panel: primero por nombre (tolerando
+// pequeñas diferencias de formato), y si no hay coincidencia, por posición
+// (la línea nº N del panel con la línea nº N real del backend) — para paneles
+// donde las líneas tienen nombres propios distintos a los del backend.
+export function buscarLectura(lecturasReales, nombreSector, posicion) {
   if (!lecturasReales) return null;
-  return lecturasReales[normalizar(nombreSector)] || null;
+  const porNombre = lecturasReales.porNombre?.[normalizar(nombreSector)];
+  if (porNombre) return porNombre;
+  if (typeof posicion === 'number') return lecturasReales.porPosicion?.[posicion] || null;
+  return null;
 }

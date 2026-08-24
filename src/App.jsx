@@ -443,7 +443,7 @@ function defaultSectors() {
     const pos = posicionesPlano[n];
     return {
       id: `sector-${n}`,
-      name: `Zona${n}`, // TEMPORAL para probar datos reales — revertir a `Línea ${n}` después
+      name: `Línea ${n}`,
       emitters: 24,
       emitterFlow: 60,
       mode: "horario",
@@ -3348,7 +3348,7 @@ export default function VerdticalControlPanel() {
       lastDayRef.current = todayStr;
     }
 
-    const updated = sectors.map((s) => {
+    const updated = sectors.map((s, indiceLinea) => {
       let manualOverride = s.manualOverride;
       if (manualOverride && manualOverride.active && new Date(manualOverride.endsAt).getTime() <= now.getTime()) {
         newEvents.push({ ts: now.toISOString(), text: `${s.name}: riego manual finalizado (tiempo agotado)` });
@@ -3377,7 +3377,7 @@ export default function VerdticalControlPanel() {
           newEvents.push({ ts: now.toISOString(), text: `${s.name}: válvula cerrada` });
         }
       }
-      const lecturaReal = buscarLectura(lecturasReales, s.name);
+      const lecturaReal = buscarLectura(lecturasReales, s.name, indiceLinea);
       let sim = lecturaReal
         ? {
             humidity: lecturaReal.humidity ?? s.sensors?.humidity ?? 45,
@@ -3713,7 +3713,7 @@ export default function VerdticalControlPanel() {
     // La presión de red es un único sensor físico compartido por toda la
     // instalación (antes del colector), así que cualquier línea con lectura
     // real de presión sirve como representante — todas deberían coincidir.
-    const presionRealDisponible = Object.values(lecturasReales || {}).find(
+    const presionRealDisponible = (lecturasReales?.porPosicion || []).find(
       (l) => l.presion !== null && l.presion !== undefined
     )?.presion;
     const nuevaPresion =
@@ -4631,7 +4631,7 @@ export default function VerdticalControlPanel() {
   // guardado (hasta 365 días) más lo que lleva hoy. Si hay datos reales de
   // Loxone, "dailyConsumption" es histórico de la demo (falso) y no debe
   // mezclarse con el total real de hoy — se muestra solo lo real.
-  const hayDatosRealesHoy = Object.keys(lecturasReales || {}).length > 0;
+  const hayDatosRealesHoy = (lecturasReales?.porPosicion?.length || 0) > 0;
   const totalLitrosHistorico = hayDatosRealesHoy
     ? todayTotalLiters
     : Math.round(dailyConsumption.reduce((sum, d) => sum + Number(d.liters || 0), 0) + todayTotalLiters);
