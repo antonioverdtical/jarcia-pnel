@@ -248,11 +248,12 @@ function formatoHora(min) {
 // cortas. Cada estación comprueba conflictos por separado, con su propia
 // ocupación (la ocupación de otras líneas puede ser distinta en cada
 // estación si esas líneas también se han recalculado así).
-function calcularProgramacionAutomaticaTodasEstaciones({ areaM2, etoBase, nominalFlow, duracionSesion, ocupacionPorEstacion }) {
+function calcularProgramacionAutomaticaTodasEstaciones({ areaM2, etoBase, nominalFlow, duracionSesion, ocupacionPorEstacion, factoresEstacionales }) {
   const schedules = {};
   const resumenPorEstacion = {};
   ESTACIONES.forEach((est) => {
-    const etoEstacional = etoBase * est.factor;
+    const factor = (factoresEstacionales && factoresEstacionales[est.key]) ?? est.factor;
+    const etoEstacional = etoBase * factor;
     const resultado = calcularProgramacionAutomatica({
       areaM2,
       eto: etoEstacional,
@@ -454,7 +455,7 @@ function defaultSectors() {
       },
       posicionPlano: pos.sensor,
       areaM2: pos.area,
-      duracionTandaAuto: 15,
+      duracionTandaAuto: 25,
       exposicion: "sol",
       hourlyConsumption: Array(24).fill(0),
       history: [],
@@ -638,6 +639,95 @@ function formatEventDate(date, now) {
   return `${diaLabel} · ${hh}:${mm}`;
 }
 
+// Calcula el domingo de Pascua para un año dado (algoritmo de Gauss), para
+// poder situar el Viernes Santo, que es festivo nacional pero cambia de
+// fecha cada año.
+function domingoPascua(anio) {
+  const a = anio % 19;
+  const b = Math.floor(anio / 100);
+  const c = anio % 100;
+  const d = Math.floor(b / 4);
+  const e = b % 4;
+  const f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4);
+  const k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const mes = Math.floor((h + l - 7 * m + 114) / 31);
+  const dia = ((h + l - 7 * m + 114) % 31) + 1;
+  return new Date(anio, mes - 1, dia);
+}
+
+// Festivos nacionales de España — los de fecha fija, más el Viernes Santo
+// (móvil, calculado a partir de la Pascua). No incluye festivos autonómicos
+// ni locales, que varían según la ubicación de cada instalación.
+function esFestivoNacional(fecha) {
+  const mes = fecha.getMonth() + 1;
+  const dia = fecha.getDate();
+  const fijos = [
+    [1, 1], // Año Nuevo
+    [1, 6], // Reyes
+    [5, 1], // Fiesta del Trabajo
+    [8, 15], // Asunción
+    [10, 12], // Fiesta Nacional de España
+    [11, 1], // Todos los Santos
+    [12, 6], // Día de la Constitución
+    [12, 8], // Inmaculada Concepción
+    [12, 25], // Navidad
+  ];
+  if (fijos.some(([m, d]) => m === mes && d === dia)) return true;
+  const pascua = domingoPascua(fecha.getFullYear());
+  const viernesSanto = new Date(pascua);
+  viernesSanto.setDate(pascua.getDate() - 2);
+  return fecha.getFullYear() === viernesSanto.getFullYear() && mes === viernesSanto.getMonth() + 1 && dia === viernesSanto.getDate();
+}
+
+// Avanza la fecha, día a día, hasta caer en un día laborable (ni fin de
+// semana ni festivo nacional).
+function siguienteDiaLaborable(fecha) {
+  const d = new Date(fecha);
+  while (d.getDay() === 0 || d.getDay() === 6 || esFestivoNacional(d)) {
+    d.setDate(d.getDate() + 1);
+  }
+  return d;
+}
+
+const MESES_POR_FRECUENCIA = {
+  mensual: 1,
+  bimensual: 2,
+  trimestral: 3,
+  cuatrimestral: 4,
+  semestral: 6,
+};
+
+// Calcula la próxima fecha de mantenimiento a partir de una fecha base y la
+// frecuencia contratada, ajustando hacia adelante si cae en fin de semana o
+// festivo nacional.
+function calcularProximoMantenimiento(fechaBase, frecuencia) {
+  const meses = MESES_POR_FRECUENCIA[frecuencia] || 1;
+  const d = new Date(fechaBase);
+  d.setMonth(d.getMonth() + meses);
+  return siguienteDiaLaborable(d);
+}
+
+// Genera todas las fechas de mantenimiento programadas dentro del año en
+// curso, empezando por la próxima fecha ya calculada y repitiendo hacia
+// adelante según la frecuencia, hasta que se sale del año.
+function fechasMantenimientoDelAnio(fechaInicio, frecuencia) {
+  const anio = new Date().getFullYear();
+  const fechas = [];
+  let cursor = new Date(fechaInicio);
+  let vueltas = 0;
+  while (cursor.getFullYear() === anio && vueltas < 24) {
+    fechas.push(new Date(cursor));
+    cursor = calcularProximoMantenimiento(cursor, frecuencia);
+    vueltas++;
+  }
+  return fechas;
+}
+
 const CATALOGO_PROCESOS_MANTENIMIENTO = [
   { key: "fertilizante", label: "Rellenar fertilizante" },
   { key: "limpieza_canal", label: "Limpieza de canal" },
@@ -657,6 +747,10 @@ const CATEGORIAS_ALARMA = [
   { key: "temperatura", label: "Temperatura fuera de rango" },
   { key: "multiples_lineas", label: "Varias líneas a la vez" },
   { key: "fertilizante", label: "Nivel de fertilizante" },
+  { key: "maestra", label: "Rotura antes de las electroválvulas (maestra)" },
+  { key: "corte_corriente", label: "Corte de corriente en el PLC" },
+  { key: "sin_datos", label: "Sin datos / comunicación perdida" },
+  { key: "sin_agua", label: "Sin agua en la red" },
 ];
 
 // IMPORTANTE PARA LA FUTURA INTEGRACIÓN CON mapa-situacion-proyectos.html:
@@ -676,6 +770,11 @@ function categoriaDeAlarma(type) {
   if (type === "temperatura_fuera_rango") return "temperatura";
   if (type === "multiples_lineas") return "multiples_lineas";
   if (type === "fertilizante_bajo" || type === "fertilizante_agotado" || type === "fertilizante_rellenado") return "fertilizante";
+  if (type === "rotura_antes_electrovalvulas") return "maestra";
+  if (type === "corte_corriente_plc") return "corte_corriente";
+  if (type === "bateria_baja") return "corte_corriente";
+  if (type === "fallo_conexion" || type === "fallo_conexion_resuelto") return "sin_datos";
+  if (type === "sin_agua_red") return "sin_agua";
   return null;
 }
 
@@ -708,6 +807,14 @@ function textoAlarma(alarm) {
       descripcion: "El controlador de campo (Loxone) se ha quedado sin corriente eléctrica. No se puede activar ninguna electroválvula sin corriente.",
       accion:
         "El sistema se ha apagado como medida de seguridad. Gracias a la batería de respaldo, los sensores (humedad, presión, caudal) siguen llegando con normalidad mientras dure la batería. Reactiva el sistema manualmente desde el botón de arriba en cuanto vuelva la corriente.",
+    };
+  }
+  if (alarm.type === "bateria_baja") {
+    return {
+      titulo: "🔋 Batería del PLC baja",
+      descripcion: `La batería de respaldo del PLC está al ${alarm.value}%, por debajo del ${alarm.umbral ?? 20}% — se agotará pronto si no vuelve la corriente.`,
+      accion:
+        "Restablecer cuanto antes el suministro eléctrico del PLC. Cuando la batería llegue a 0%, se perderán todos los datos del panel (sensores, presión, caudal) hasta que vuelva la corriente.",
     };
   }
   if (alarm.type === "rotura_antes_electrovalvulas") {
@@ -749,8 +856,19 @@ function textoAlarma(alarm) {
       accion: "Confirmar que la línea vuelve a regar con normalidad en el próximo ciclo programado.",
     };
   }
+  if (alarm.type === "sin_agua_red") {
+    return {
+      titulo: "⛔ Sin agua en la red",
+      descripcion: `La presión de la red (${alarm.value} bar) lleva varios minutos por debajo de ${alarm.umbralSinAgua ?? 0.5} bar de forma continuada — no hay agua llegando, más grave que una simple presión baja.`,
+      accion:
+        "Comprobar urgentemente el suministro general: llave de paso cerrada, corte del suministro municipal, rotura de tubería principal o bomba de impulsión parada.",
+    };
+  }
   if (alarm.type === "presion_baja" || alarm.type === "presion_alta") {
-    const cual = alarm.type === "presion_baja" ? "por debajo de 1,0 bar" : "por encima de 4,0 bar";
+    const cual =
+      alarm.type === "presion_baja"
+        ? `por debajo de ${alarm.umbralBaja ?? 1.0} bar`
+        : `por encima de ${alarm.umbralAlta ?? 4.0} bar`;
     return {
       titulo: alarm.type === "presion_baja" ? "Presión de red sostenidamente baja" : "Presión de red sostenidamente alta",
       descripcion: `La presión de la red (${alarm.value} bar) lleva varios minutos ${cual} de forma continuada.`,
@@ -799,14 +917,14 @@ function textoAlarma(alarm) {
   if (alarm.type === "fertilizante_bajo") {
     return {
       titulo: "Nivel de fertilizante bajo",
-      descripcion: `El depósito de fertilizante está al ${alarm.value}%, por debajo del 15% de reserva recomendado.`,
+      descripcion: `El depósito de fertilizante está al ${alarm.value}%, por debajo del ${alarm.umbral ?? 15}% de reserva recomendado.`,
       accion: "Preparar el rellenado del depósito de fertirrigación en los próximos días para no interrumpir la dosificación.",
     };
   }
   if (alarm.type === "fertilizante_agotado") {
     return {
       titulo: "Depósito de fertilizante prácticamente agotado",
-      descripcion: `El depósito de fertilizante está al ${alarm.value}%, por debajo del 5%. El riego sigue funcionando con agua, pero sin dosificación efectiva.`,
+      descripcion: `El depósito de fertilizante está al ${alarm.value}%, por debajo del ${alarm.umbral ?? 5}%. El riego sigue funcionando con agua, pero sin dosificación efectiva.`,
       accion: "Rellenar el depósito de fertilizante lo antes posible para no perder el aporte nutricional programado.",
     };
   }
@@ -1040,7 +1158,7 @@ function HorarioRow({ evento, index, onChange, onRemove, canRemove, conflicto })
   );
 }
 
-function SectorCard({ sector, now, mainSupply, maestraCerrada, tecnico, cliente, presionEnRangoTrabajo, balanceHidrico, umbralBalanceHidrico, todosLosSectores, etoSol, etoSemisombra, etoSombra, alarmHistory, onUpdate, onRemove, onRearm, onRearmFault }) {
+function SectorCard({ sector, now, mainSupply, maestraCerrada, tecnico, cliente, presionEnRangoTrabajo, balanceHidrico, umbralBalanceHidrico, todosLosSectores, etoSol, etoSemisombra, etoSombra, factoresEstacionales, alarmHistory, onUpdate, onRemove, onRearm, onRearmFault }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [editingSchedule, setEditingSchedule] = useState(false);
   const [showCharts, setShowCharts] = useState(false);
@@ -1872,7 +1990,7 @@ function SectorCard({ sector, now, mainSupply, maestraCerrada, tecnico, cliente,
                 <input
                   type="number"
                   min="1"
-                  value={sector.duracionTandaAuto ?? 15}
+                  value={sector.duracionTandaAuto ?? 25}
                   onChange={(e) => onUpdate({ ...sector, duracionTandaAuto: Math.max(1, Number(e.target.value) || 1) })}
                   className="vc-plano-input-sm"
                   onClick={(e) => e.stopPropagation()}
@@ -1890,8 +2008,9 @@ function SectorCard({ sector, now, mainSupply, maestraCerrada, tecnico, cliente,
                     areaM2: sector.areaM2,
                     etoBase: etoLinea,
                     nominalFlow,
-                    duracionSesion: sector.duracionTandaAuto ?? 15,
+                    duracionSesion: sector.duracionTandaAuto ?? 25,
                     ocupacionPorEstacion,
+                    factoresEstacionales,
                   });
                   onUpdate({ ...sector, schedules: nuevosSchedules });
                   const conflictosTotales = Object.values(resumenPorEstacion).reduce((sum, r) => sum + r.conflictosSinResolver, 0);
@@ -1908,7 +2027,7 @@ function SectorCard({ sector, now, mainSupply, maestraCerrada, tecnico, cliente,
               </button>
               <p className="vc-tecnico-hint" style={{ margin: "4px 0 0" }}>
                 Con {sector.areaM2} m² y exposición "{sector.exposicion || "sol"}", calcula, PARA CADA ESTACIÓN por separado,
-                cuántas tandas de {sector.duracionTandaAuto ?? 15} min hacen falta para completar el agua que toca ese trimestre —
+                cuántas tandas de {sector.duracionTandaAuto ?? 25} min hacen falta para completar el agua que toca ese trimestre —
                 el tamaño de tanda se mantiene siempre igual, lo que cambia es cuántas veces se repite (menos en invierno, más en
                 verano), evitando coincidir con las demás líneas en cada estación por separado. Cambia el número de ahí arriba y
                 vuelve a pulsar para recalcular con otro tamaño de tanda.
@@ -2094,32 +2213,99 @@ function CollectorFlow({ lines }) {
   );
 }
 
-function PressureGauge({ bar }) {
-  const min = 0;
-  const max = 5;
-  const pct = clamp((bar - min) / (max - min), 0, 1);
-  const angle = -90 + pct * 180;
+// Mini-calendario de un mes (7 columnas, empezando en lunes), con los días
+// indicados en diasMarcados resaltados — usado para ver de un vistazo las
+// fechas de mantenimiento programadas en el año.
+function MiniCalendarMes({ anio, mes, diasMarcados }) {
+  const primerDiaSemana = new Date(anio, mes, 1).getDay();
+  const offset = (primerDiaSemana + 6) % 7; // 0 = lunes
+  const diasEnMes = new Date(anio, mes + 1, 0).getDate();
+  const celdas = [];
+  for (let i = 0; i < offset; i++) celdas.push(null);
+  for (let d = 1; d <= diasEnMes; d++) celdas.push(d);
+  const nombreMes = new Date(anio, mes, 1).toLocaleDateString("es-ES", { month: "long" });
+  const hoy = new Date();
+  const esMesActual = hoy.getFullYear() === anio && hoy.getMonth() === mes;
   return (
-    <svg width="64" height="40" viewBox="0 0 64 40" aria-hidden="true">
-      <path d="M 6 36 A 26 26 0 0 1 58 36" fill="none" stroke="var(--vc-border)" strokeWidth="5" strokeLinecap="round" />
-      <path
-        d="M 6 36 A 26 26 0 0 1 58 36"
-        fill="none"
-        stroke={bar < 1.0 || bar > 4.0 ? "var(--vc-red)" : "var(--vc-flow)"}
-        strokeWidth="5"
-        strokeLinecap="round"
-        strokeDasharray={`${pct * 81.7} 200`}
-      />
-      <line
-        x1="32"
-        y1="36"
-        x2={32 + 20 * Math.cos((angle * Math.PI) / 180)}
-        y2={36 + 20 * Math.sin((angle * Math.PI) / 180)}
-        stroke="var(--vc-brass)"
-        strokeWidth="2"
-        strokeLinecap="round"
-      />
+    <div className="vc-mini-cal-mes">
+      <div className="vc-mini-cal-mes-nombre">{nombreMes}</div>
+      <div className="vc-mini-cal-grid">
+        {["L", "M", "X", "J", "V", "S", "D"].map((d, i) => (
+          <div className="vc-mini-cal-dow" key={i}>
+            {d}
+          </div>
+        ))}
+        {celdas.map((d, i) => {
+          const esHoy = esMesActual && d === hoy.getDate();
+          const marcado = d && diasMarcados.includes(d);
+          return (
+            <div
+              className={
+                marcado ? "vc-mini-cal-dia vc-mini-cal-dia-on" : esHoy ? "vc-mini-cal-dia vc-mini-cal-dia-hoy" : "vc-mini-cal-dia"
+              }
+              key={i}
+            >
+              {d || ""}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+
+function PressureGauge({ bar, umbralSinAgua = 0.5, umbralBaja = 1.8, umbralAlta = 4.0, escalaMax = 6 }) {
+  const min = 0;
+  const max = escalaMax;
+  const pct = clamp((bar - min) / (max - min), 0, 1);
+  const angle = pct * 180 - 180;
+  const ARC_D = "M 6 36 A 26 26 0 0 1 58 36";
+  const L = 81.68; // longitud aproximada del arco completo (semicírculo de radio 26)
+  // Zonas de alerta de presión, configuradas en Ajustes: por debajo de
+  // umbralSinAgua sin agua, hasta umbralBaja presión baja, hasta umbralAlta
+  // correcta, y por encima presión alta.
+  const zonas = [
+    { desde: 0, hasta: umbralSinAgua, color: "var(--vc-red)" },
+    { desde: umbralSinAgua, hasta: umbralBaja, color: "var(--vc-amber)" },
+    { desde: umbralBaja, hasta: umbralAlta, color: "var(--vc-flow)" },
+    { desde: umbralAlta, hasta: max, color: "var(--vc-red)" },
+  ];
+  return (
+    <svg width="64" height="46" viewBox="0 0 64 46" aria-hidden="true">
+      <path d={ARC_D} fill="none" stroke="var(--vc-border)" strokeWidth="5" strokeLinecap="round" />
+      {zonas.map((z, i) => {
+        const start = (z.desde / max) * L;
+        const len = ((z.hasta - z.desde) / max) * L;
+        return (
+          <path
+            key={i}
+            d={ARC_D}
+            fill="none"
+            stroke={z.color}
+            strokeWidth="5"
+            strokeLinecap={i === 0 || i === zonas.length - 1 ? "round" : "butt"}
+            strokeDasharray={`${len} ${L}`}
+            strokeDashoffset={-start}
+          />
+        );
+      })}
+      <g
+        style={{
+          transformOrigin: "32px 36px",
+          transform: `rotate(${angle}deg)`,
+          transition: "transform 0.6s ease",
+        }}
+      >
+        <line x1="32" y1="36" x2="52" y2="36" stroke="var(--vc-brass)" strokeWidth="2" strokeLinecap="round" />
+      </g>
       <circle cx="32" cy="36" r="2.5" fill="var(--vc-brass)" />
+      <text x="6" y="44" fontSize="6" fill="var(--vc-text-muted)" textAnchor="middle">
+        {min}
+      </text>
+      <text x="58" y="44" fontSize="6" fill="var(--vc-text-muted)" textAnchor="middle">
+        {max}
+      </text>
     </svg>
   );
 }
@@ -2303,7 +2489,7 @@ function ChartTooltip({ active, payload, label, unit }) {
 function TrendChart({ data, color, unit, dataKey = "value", height = 130, umbralMin, umbralMax }) {
   return (
     <ResponsiveContainer width="100%" height={height}>
-      <LineChart data={data} margin={{ top: 6, right: 8, bottom: 0, left: -8 }}>
+      <LineChart data={data} margin={{ top: 6, right: 8, bottom: 0, left: 0 }}>
         <CartesianGrid stroke="var(--vc-border)" strokeDasharray="3 3" vertical={false} />
         <XAxis
           dataKey="label"
@@ -2425,6 +2611,11 @@ export default function VerdticalControlPanel() {
   const [pressureBar, setPressureBar] = useState(2.6);
   const [now, setNow] = useState(new Date());
   const [loaded, setLoaded] = useState(false);
+  // Pantalla activa: 'lineas' (inicio, tarjetas de cada línea), 'plano',
+  // 'programacion' (horarios) o 'ajustes' (técnico, cliente, historial...).
+  // Se navega con la barra de pestañas de abajo, para no amontonar todo en
+  // una sola pantalla.
+  const [pantallaActiva, setPantallaActiva] = useState("lineas");
   const [proyecto, setProyecto] = useState({ id: "", nombre: "" });
   const [showProyectoConfig, setShowProyectoConfig] = useState(false);
   const [isOnline, setIsOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
@@ -2439,19 +2630,32 @@ export default function VerdticalControlPanel() {
   const [copiadoCliente, setCopiadoCliente] = useState(false);
   const [showFertilizerHistory, setShowFertilizerHistory] = useState(false);
   const [showRedHistory, setShowRedHistory] = useState(false);
-  const [showPlano, setShowPlano] = useState(false);
   const [planoImagen, setPlanoImagen] = useState(PLANO_DEMO_IMAGEN);
   const [lineaColocando, setLineaColocando] = useState(null);
   const [lineaResaltada, setLineaResaltada] = useState(null);
+  const [showPlanoImagen, setShowPlanoImagen] = useState(false);
+  const [showBalanceHidricoConfig, setShowBalanceHidricoConfig] = useState(false);
+  const balanceHidricoDropdownRef = useRef(null);
   // Superficie calculada del plano real: zona grande 49,43 x 5,00 m + zona
   // pequeña 19,38 x 5,00 m = 344,05 m². Editable por si cambia la instalación.
   const [etoSol, setEtoSol] = useState(7);
   const [etoSemisombra, setEtoSemisombra] = useState(4.75);
   const [etoSombra, setEtoSombra] = useState(2.5);
+  // Factores estacionales: multiplican el ETo base según la estación
+  // (verano riega más, invierno mucho menos). Configurables, con los mismos
+  // valores por defecto que tenía el panel fijos en el código.
+  const [factoresEstacionales, setFactoresEstacionales] = useState({
+    primavera: 0.75,
+    verano: 1,
+    otono: 0.55,
+    invierno: 0.3,
+  });
   const [umbralBalanceHidrico, setUmbralBalanceHidrico] = useState(30);
   const [wueGramosPorLitro, setWueGramosPorLitro] = useState(2.5);
   const [showAnnualWaterHistory, setShowAnnualWaterHistory] = useState(false);
   const [waterAnnualOffset, setWaterAnnualOffset] = useState(0);
+  const [showAnnualFertilizerHistory, setShowAnnualFertilizerHistory] = useState(false);
+  const [fertilizerAnnualOffset, setFertilizerAnnualOffset] = useState(0);
   const [selectedGlobalConsumoDay, setSelectedGlobalConsumoDay] = useState(null);
   const [showAnnualPressureHistory, setShowAnnualPressureHistory] = useState(false);
   const [pressureAnnualOffset, setPressureAnnualOffset] = useState(0);
@@ -2460,14 +2664,14 @@ export default function VerdticalControlPanel() {
     telefono: "",
     email: "",
     emailAvisos: "",
-    alarmas: { fugas: true, fallo_electrico: true, embozo: true, presion: true, humedad: true, ec: true, temperatura: true, multiples_lineas: true, fertilizante: true },
+    alarmas: { fugas: true, fallo_electrico: true, embozo: true, presion: true, humedad: true, ec: true, temperatura: true, multiples_lineas: true, fertilizante: true, maestra: true, corte_corriente: true, sin_datos: true, sin_agua: true },
   });
   const [cliente, setCliente] = useState({
     nombre: "",
     telefono: "",
     email: "",
     emailAvisos: "",
-    alarmas: { fugas: false, fallo_electrico: false, embozo: false, presion: false, humedad: false, ec: false, temperatura: false, multiples_lineas: false, fertilizante: false },
+    alarmas: { fugas: false, fallo_electrico: false, embozo: false, presion: false, humedad: false, ec: false, temperatura: false, multiples_lineas: false, fertilizante: false, maestra: false, corte_corriente: false, sin_datos: false, sin_agua: false },
   });
   const [procesosRealizados, setProcesosRealizados] = useState({});
   const [notaObservacion, setNotaObservacion] = useState("");
@@ -2477,6 +2681,52 @@ export default function VerdticalControlPanel() {
   const [fertilizerAlert, setFertilizerAlert] = useState(null);
   const [fertilizerConsumedToday, setFertilizerConsumedToday] = useState(0);
   const [fertilizerDailyHistory, setFertilizerDailyHistory] = useState([]);
+  const [fertilizerHourlyConsumption, setFertilizerHourlyConsumption] = useState(Array(24).fill(0));
+  const [fertilizerHourlyHistory, setFertilizerHourlyHistory] = useState([]);
+  const [selectedFertilizerDay, setSelectedFertilizerDay] = useState(null);
+  // Configuración real del depósito y la dosis — antes estaban fijos en el
+  // código (20 L de depósito, 1 mL de fertilizante por litro de agua);
+  // ahora se pueden ajustar desde la pantalla de Ajustes según la
+  // instalación real.
+  const [fertilizerTanqueL, setFertilizerTanqueL] = useState(20);
+  const [fertilizerDosisMlPorLitro, setFertilizerDosisMlPorLitro] = useState(1);
+  // Umbrales de las zonas de alerta de presión (bar) — configurables desde
+  // Ajustes. Por debajo de presionSinAgua: sin agua. Entre eso y
+  // presionBaja: presión baja. Entre eso y presionAlta: correcta. Por
+  // encima: presión alta. presionEscalaMax es el tope del manómetro.
+  const [presionSinAgua, setPresionSinAgua] = useState(0.5);
+  const [presionBaja, setPresionBaja] = useState(1.8);
+  const [presionAlta, setPresionAlta] = useState(4.0);
+  const [presionEscalaMax, setPresionEscalaMax] = useState(6);
+  // Cada zona de presión avisa según su propia urgencia: sin agua es lo más
+  // grave (menos horas de margen), presión alta/baja son menos urgentes.
+  const [presionHorasSinAgua, setPresionHorasSinAgua] = useState(1);
+  const [presionHorasBaja, setPresionHorasBaja] = useState(6);
+  const [presionHorasAlta, setPresionHorasAlta] = useState(6);
+  // Umbrales configurables del resto de alarmas globales (no ligadas a una
+  // línea concreta): nivel de fertilizante bajo/agotado, y a partir de
+  // cuántas líneas con incidencia simultánea se avisa de "varias líneas".
+  const [fertilizanteUmbralBajo, setFertilizanteUmbralBajo] = useState(15);
+  const [fertilizanteUmbralAgotado, setFertilizanteUmbralAgotado] = useState(5);
+  const [multiplesLineasUmbral, setMultiplesLineasUmbral] = useState(3);
+  const [fertilizanteHorasSostenidas, setFertilizanteHorasSostenidas] = useState(1);
+  const [multiplesLineasHorasSostenidas, setMultiplesLineasHorasSostenidas] = useState(0.5);
+  // Batería de respaldo del PLC: se descarga mientras dura un corte de
+  // corriente real (o simulado con el botón de prueba), y se recarga en
+  // cuanto vuelve la corriente. Al llegar a 0% se considera "sin datos".
+  const [bateriaPlcNivel, setBateriaPlcNivel] = useState(100);
+  const [bateriaUmbralBaja, setBateriaUmbralBaja] = useState(20);
+  const [bateriaAutonomiaHoras, setBateriaAutonomiaHoras] = useState(4);
+  const [plcSinCorriente, setPlcSinCorriente] = useState(false);
+  // Umbral de caudal (% del nominal) y horas sostenidas para las alarmas de
+  // rotura antes del colector, fuga leve y embozo — configurables aquí de
+  // forma global; los umbrales de % de fuga leve/embozo por línea siguen
+  // pudiendo ajustarse en cada tarjeta si hace falta un valor distinto.
+  const [roturaColectorLitrosHora, setRoturaColectorLitrosHora] = useState(5);
+  const [roturaColectorHorasSostenidas, setRoturaColectorHorasSostenidas] = useState(0.03);
+  const [corteCorrienteHorasSostenidas, setCorteCorrienteHorasSostenidas] = useState(0);
+  const [fugaLeveHorasSostenidas, setFugaLeveHorasSostenidas] = useState(0.5);
+  const [embozoHorasSostenidas, setEmbozoHorasSostenidas] = useState(0.5);
   const [pressureDailyHistory, setPressureDailyHistory] = useState([]);
   const [pressureHourlyHistory, setPressureHourlyHistory] = useState([]);
   const pressureLastHourRef = useRef(null);
@@ -2488,8 +2738,28 @@ export default function VerdticalControlPanel() {
   const activityDropdownRef = useRef(null);
   const tecnicoDropdownRef = useRef(null);
   const clienteDropdownRef = useRef(null);
+  const [showMantenimientoConfig, setShowMantenimientoConfig] = useState(false);
+  const [showAlarmasGlobalesConfig, setShowAlarmasGlobalesConfig] = useState(false);
+  const [showPruebasBox, setShowPruebasBox] = useState(false);
+  const [showEtoConfig, setShowEtoConfig] = useState(false);
+  const etoDropdownRef = useRef(null);
+  const [showDuracionTandaConfig, setShowDuracionTandaConfig] = useState(false);
+  const [firmaDataUrl, setFirmaDataUrl] = useState(null);
+  const [firmaFecha, setFirmaFecha] = useState(null);
+  const firmaCanvasRef = useRef(null);
+  const firmaDibujandoRef = useRef(false);
+  const duracionTandaDropdownRef = useRef(null);
+  const pruebasDropdownRef = useRef(null);
+  const [showUtilidadesBox, setShowUtilidadesBox] = useState(false);
+  const utilidadesDropdownRef = useRef(null);
+  const alarmasGlobalesDropdownRef = useRef(null);
+  const mantenimientoDropdownRef = useRef(null);
   const fertilizerDropdownRef = useRef(null);
   const redDropdownRef = useRef(null);
+  const [showLitrosChart, setShowLitrosChart] = useState(false);
+  const litrosDropdownRef = useRef(null);
+  const [showPresionChart, setShowPresionChart] = useState(false);
+  const presionDropdownRef = useRef(null);
   const [history, setHistory] = useState([]);
   const [flowHistory, setFlowHistory] = useState([]);
   const [pressureHistory, setPressureHistory] = useState([]);
@@ -2520,7 +2790,14 @@ export default function VerdticalControlPanel() {
   const caudalLastHourRef = useRef({});
   const caudalSumTodayRef = useRef({});
   const caudalCountTodayRef = useRef({});
-  const pressureOutTicksRef = useRef(0);
+  const pressureSinAguaTicksRef = useRef(0);
+  const pressureBajaTicksRef = useRef(0);
+  const pressureAltaTicksRef = useRef(0);
+  const fertilizerBajoTicksRef = useRef(0);
+  const fertilizerAgotadoTicksRef = useRef(0);
+  const multiLineTicksRef = useRef(0);
+  const roturaColectorTicksRef = useRef(0);
+  const bateriaBajaAlertadaRef = useRef(false);
   const fertilizerAlertedRef = useRef({ bajo: false, agotado: false });
   const sessionStartRef = useRef({});
   const lastDayRef = useRef(null);
@@ -2556,7 +2833,7 @@ export default function VerdticalControlPanel() {
             telefono: "",
             email: "",
             emailAvisos: "",
-            alarmas: { fugas: true, fallo_electrico: true, embozo: true, presion: true, humedad: true, ec: true, temperatura: true, multiples_lineas: true, fertilizante: true },
+            alarmas: { fugas: true, fallo_electrico: true, embozo: true, presion: true, humedad: true, ec: true, temperatura: true, multiples_lineas: true, fertilizante: true, maestra: true, corte_corriente: true, sin_datos: true, sin_agua: true },
             ...(parsed.tecnico || {}),
             alarmas: {
               fugas: true,
@@ -2576,7 +2853,7 @@ export default function VerdticalControlPanel() {
             telefono: "",
             email: "",
             emailAvisos: "",
-            alarmas: { fugas: false, fallo_electrico: false, embozo: false, presion: false, humedad: false, ec: false, temperatura: false, multiples_lineas: false, fertilizante: false },
+            alarmas: { fugas: false, fallo_electrico: false, embozo: false, presion: false, humedad: false, ec: false, temperatura: false, multiples_lineas: false, fertilizante: false, maestra: false, corte_corriente: false, sin_datos: false, sin_agua: false },
             ...(parsed.cliente || {}),
             alarmas: {
               fugas: false,
@@ -2596,6 +2873,9 @@ export default function VerdticalControlPanel() {
           setEtoSol(parsed.etoSol ?? 7);
           setEtoSemisombra(parsed.etoSemisombra ?? 4.75);
           setEtoSombra(parsed.etoSombra ?? 2.5);
+          setFactoresEstacionales(
+            parsed.factoresEstacionales || { primavera: 0.75, verano: 1, otono: 0.55, invierno: 0.3 }
+          );
           setUmbralBalanceHidrico(parsed.umbralBalanceHidrico ?? 30);
           setWueGramosPorLitro(parsed.wueGramosPorLitro ?? 2.5);
           setNotaObservacion(parsed.notaObservacion || "");
@@ -2610,6 +2890,41 @@ export default function VerdticalControlPanel() {
               ? parsed.fertilizerDailyHistory
               : demoFertilizerHistory()
           );
+          setFertilizerHourlyConsumption(
+            Array.isArray(parsed.fertilizerHourlyConsumption) ? parsed.fertilizerHourlyConsumption : Array(24).fill(0)
+          );
+          setFertilizerHourlyHistory(parsed.fertilizerHourlyHistory || []);
+          setFertilizerTanqueL(parsed.fertilizerTanqueL !== undefined ? parsed.fertilizerTanqueL : 20);
+          setFertilizerDosisMlPorLitro(parsed.fertilizerDosisMlPorLitro !== undefined ? parsed.fertilizerDosisMlPorLitro : 1);
+          setPresionSinAgua(parsed.presionSinAgua !== undefined ? parsed.presionSinAgua : 0.5);
+          setPresionBaja(parsed.presionBaja !== undefined ? parsed.presionBaja : 1.8);
+          setPresionAlta(parsed.presionAlta !== undefined ? parsed.presionAlta : 4.0);
+          setPresionEscalaMax(parsed.presionEscalaMax !== undefined ? parsed.presionEscalaMax : 6);
+          setPresionHorasSinAgua(parsed.presionHorasSinAgua !== undefined ? parsed.presionHorasSinAgua : 1);
+          setPresionHorasBaja(parsed.presionHorasBaja !== undefined ? parsed.presionHorasBaja : 6);
+          setPresionHorasAlta(parsed.presionHorasAlta !== undefined ? parsed.presionHorasAlta : 6);
+          setFertilizanteUmbralBajo(parsed.fertilizanteUmbralBajo !== undefined ? parsed.fertilizanteUmbralBajo : 15);
+          setFertilizanteUmbralAgotado(parsed.fertilizanteUmbralAgotado !== undefined ? parsed.fertilizanteUmbralAgotado : 5);
+          setMultiplesLineasUmbral(parsed.multiplesLineasUmbral !== undefined ? parsed.multiplesLineasUmbral : 3);
+          setFertilizanteHorasSostenidas(parsed.fertilizanteHorasSostenidas !== undefined ? parsed.fertilizanteHorasSostenidas : 1);
+          setMultiplesLineasHorasSostenidas(
+            parsed.multiplesLineasHorasSostenidas !== undefined ? parsed.multiplesLineasHorasSostenidas : 0.5
+          );
+          setBateriaPlcNivel(parsed.bateriaPlcNivel !== undefined ? parsed.bateriaPlcNivel : 100);
+          setBateriaUmbralBaja(parsed.bateriaUmbralBaja !== undefined ? parsed.bateriaUmbralBaja : 20);
+          setBateriaAutonomiaHoras(parsed.bateriaAutonomiaHoras !== undefined ? parsed.bateriaAutonomiaHoras : 4);
+          setRoturaColectorLitrosHora(parsed.roturaColectorLitrosHora !== undefined ? parsed.roturaColectorLitrosHora : 5);
+          setRoturaColectorHorasSostenidas(
+            parsed.roturaColectorHorasSostenidas !== undefined ? parsed.roturaColectorHorasSostenidas : 0.03
+          );
+          setCorteCorrienteHorasSostenidas(
+            parsed.corteCorrienteHorasSostenidas !== undefined ? parsed.corteCorrienteHorasSostenidas : 0
+          );
+          setFugaLeveHorasSostenidas(parsed.fugaLeveHorasSostenidas !== undefined ? parsed.fugaLeveHorasSostenidas : 0.5);
+          setEmbozoHorasSostenidas(parsed.embozoHorasSostenidas !== undefined ? parsed.embozoHorasSostenidas : 0.5);
+          bateriaBajaAlertadaRef.current = parsed.bateriaBajaAlertada || false;
+          setFirmaDataUrl(parsed.firmaDataUrl || null);
+          setFirmaFecha(parsed.firmaFecha || null);
           fertilizerAlertedRef.current = parsed.fertilizerAlerted || { bajo: false, agotado: false };
           setPressureDailyHistory(
             parsed.pressureDailyHistory && parsed.pressureDailyHistory.length > 0
@@ -2657,7 +2972,7 @@ export default function VerdticalControlPanel() {
   // "datosActivos" combina la conexión real del navegador con el
   // interruptor de pruebas de batería agotada — es lo que de verdad decide
   // si hay datos o no, en vez de usar isOnline directamente en todos lados.
-  const datosActivos = isOnline && !simulacionBateriaAgotada;
+  const datosActivos = isOnline && !simulacionBateriaAgotada && bateriaPlcNivel > 0;
 
   // La falta de datos es un problema del PANEL viendo el sistema, no del
   // sistema en sí: el PLC sigue regando aunque el panel se quede a ciegas
@@ -2687,8 +3002,41 @@ export default function VerdticalControlPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [datosActivos, loaded]);
 
+  // Carga/descarga de la batería del PLC — en un efecto APARTE del resto de
+  // sensores, para que siga funcionando aunque la batería llegue a 0% y todo
+  // lo demás se congele por falta de datos (si no, nunca podría recargarse).
   useEffect(() => {
-    if (!showAlarmHistory && !showActivityLog && !showTecnicoConfig && !showClienteConfig && !showFertilizerHistory && !showRedHistory) return;
+    if (!loaded) return;
+    if (plcSinCorriente) {
+      const tasaPorTick = 100 / Math.max(1, (bateriaAutonomiaHoras * 3600) / 15);
+      const nuevoNivelBateria = Math.max(0, Math.round((bateriaPlcNivel - tasaPorTick) * 10) / 10);
+      setBateriaPlcNivel(nuevoNivelBateria);
+      if (nuevoNivelBateria <= bateriaUmbralBaja && !bateriaBajaAlertadaRef.current) {
+        bateriaBajaAlertadaRef.current = true;
+        setAlarmHistory((prev) =>
+          [
+            {
+              id: `alarm-bateria-${Date.now()}`,
+              ts: new Date().toISOString(),
+              lineId: null,
+              lineName: "Batería del PLC",
+              type: "bateria_baja",
+              value: nuevoNivelBateria,
+              umbral: bateriaUmbralBaja,
+            },
+            ...prev,
+          ].slice(0, MAX_ALARM_LOG)
+        );
+      }
+    } else if (bateriaPlcNivel < 100) {
+      setBateriaPlcNivel(100);
+      bateriaBajaAlertadaRef.current = false;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [now, loaded, plcSinCorriente]);
+
+  useEffect(() => {
+    if (!showAlarmHistory && !showActivityLog && !showTecnicoConfig && !showClienteConfig && !showFertilizerHistory && !showRedHistory && !showLitrosChart && !showPresionChart && !showMantenimientoConfig && !showAlarmasGlobalesConfig && !showPruebasBox && !showUtilidadesBox && !showEtoConfig && !showDuracionTandaConfig && !showBalanceHidricoConfig) return;
     const handleClickOutside = (e) => {
       if (showAlarmHistory && alarmDropdownRef.current && !alarmDropdownRef.current.contains(e.target)) {
         setShowAlarmHistory(false);
@@ -2708,10 +3056,37 @@ export default function VerdticalControlPanel() {
       if (showRedHistory && redDropdownRef.current && !redDropdownRef.current.contains(e.target)) {
         setShowRedHistory(false);
       }
+      if (showLitrosChart && litrosDropdownRef.current && !litrosDropdownRef.current.contains(e.target)) {
+        setShowLitrosChart(false);
+      }
+      if (showPresionChart && presionDropdownRef.current && !presionDropdownRef.current.contains(e.target)) {
+        setShowPresionChart(false);
+      }
+      if (showMantenimientoConfig && mantenimientoDropdownRef.current && !mantenimientoDropdownRef.current.contains(e.target)) {
+        setShowMantenimientoConfig(false);
+      }
+      if (showAlarmasGlobalesConfig && alarmasGlobalesDropdownRef.current && !alarmasGlobalesDropdownRef.current.contains(e.target)) {
+        setShowAlarmasGlobalesConfig(false);
+      }
+      if (showPruebasBox && pruebasDropdownRef.current && !pruebasDropdownRef.current.contains(e.target)) {
+        setShowPruebasBox(false);
+      }
+      if (showUtilidadesBox && utilidadesDropdownRef.current && !utilidadesDropdownRef.current.contains(e.target)) {
+        setShowUtilidadesBox(false);
+      }
+      if (showEtoConfig && etoDropdownRef.current && !etoDropdownRef.current.contains(e.target)) {
+        setShowEtoConfig(false);
+      }
+      if (showDuracionTandaConfig && duracionTandaDropdownRef.current && !duracionTandaDropdownRef.current.contains(e.target)) {
+        setShowDuracionTandaConfig(false);
+      }
+      if (showBalanceHidricoConfig && balanceHidricoDropdownRef.current && !balanceHidricoDropdownRef.current.contains(e.target)) {
+        setShowBalanceHidricoConfig(false);
+      }
     };
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [showAlarmHistory, showActivityLog, showTecnicoConfig, showClienteConfig, showFertilizerHistory, showRedHistory]);
+  }, [showAlarmHistory, showActivityLog, showTecnicoConfig, showClienteConfig, showFertilizerHistory, showRedHistory, showLitrosChart, showPresionChart, showMantenimientoConfig, showAlarmasGlobalesConfig, showPruebasBox, showUtilidadesBox, showEtoConfig, showDuracionTandaConfig, showBalanceHidricoConfig]);
 
   useEffect(() => {
     if (!loaded || !sectors) return;
@@ -2740,6 +3115,7 @@ export default function VerdticalControlPanel() {
             etoSol,
             etoSemisombra,
             etoSombra,
+            factoresEstacionales,
             umbralBalanceHidrico,
             wueGramosPorLitro,
             pressureAlert,
@@ -2749,6 +3125,33 @@ export default function VerdticalControlPanel() {
             fertilizerAlerted: fertilizerAlertedRef.current,
             fertilizerConsumedToday,
             fertilizerDailyHistory: fertilizerDailyHistory.slice(-MAX_DIAS_HISTORICO),
+            fertilizerHourlyConsumption,
+            fertilizerHourlyHistory: fertilizerHourlyHistory.slice(-MAX_DIAS_HORARIO),
+            fertilizerTanqueL,
+            fertilizerDosisMlPorLitro,
+            presionSinAgua,
+            presionBaja,
+            presionAlta,
+            presionEscalaMax,
+            presionHorasSinAgua,
+            presionHorasBaja,
+            presionHorasAlta,
+            fertilizanteUmbralBajo,
+            fertilizanteUmbralAgotado,
+            multiplesLineasUmbral,
+            fertilizanteHorasSostenidas,
+            multiplesLineasHorasSostenidas,
+            bateriaPlcNivel,
+            bateriaUmbralBaja,
+            bateriaAutonomiaHoras,
+            roturaColectorLitrosHora,
+            roturaColectorHorasSostenidas,
+            corteCorrienteHorasSostenidas,
+            fugaLeveHorasSostenidas,
+            embozoHorasSostenidas,
+            bateriaBajaAlertada: bateriaBajaAlertadaRef.current,
+            firmaDataUrl,
+            firmaFecha,
             pressureDailyHistory: pressureDailyHistory.slice(-MAX_DIAS_HISTORICO),
             pressureSumToday: pressureSumTodayRef.current,
             pressureCountToday: pressureCountTodayRef.current,
@@ -2782,6 +3185,7 @@ export default function VerdticalControlPanel() {
     etoSol,
     etoSemisombra,
     etoSombra,
+    factoresEstacionales,
     umbralBalanceHidrico,
     wueGramosPorLitro,
     pressureAlert,
@@ -2790,6 +3194,32 @@ export default function VerdticalControlPanel() {
     fertilizerAlert,
     fertilizerConsumedToday,
     fertilizerDailyHistory,
+    fertilizerHourlyConsumption,
+    fertilizerHourlyHistory,
+    fertilizerTanqueL,
+    fertilizerDosisMlPorLitro,
+    presionSinAgua,
+    presionBaja,
+    presionAlta,
+    presionEscalaMax,
+    presionHorasSinAgua,
+    presionHorasBaja,
+    presionHorasAlta,
+    fertilizanteUmbralBajo,
+    fertilizanteUmbralAgotado,
+    multiplesLineasUmbral,
+    fertilizanteHorasSostenidas,
+    multiplesLineasHorasSostenidas,
+    bateriaPlcNivel,
+    bateriaUmbralBaja,
+    bateriaAutonomiaHoras,
+    roturaColectorLitrosHora,
+    roturaColectorHorasSostenidas,
+    corteCorrienteHorasSostenidas,
+    fugaLeveHorasSostenidas,
+    embozoHorasSostenidas,
+    firmaDataUrl,
+    firmaFecha,
     pressureDailyHistory,
     pressureOutageLog,
     pressureHourlyHistory,
@@ -2885,6 +3315,8 @@ export default function VerdticalControlPanel() {
       let blockedByLeak = s.blockedByLeak || false;
       let minorLeakFlag = s.minorLeakFlag || false;
       let clogFlag = s.clogFlag || false;
+      let fugaLeveTicks = s.fugaLeveTicks || 0;
+      let embozoTicks = s.embozoTicks || 0;
       let flowAlarmLog = s.flowAlarmLog || [];
       if (active && nominalFlow > 0 && presionEnRangoTrabajo) {
         const flowMinPct = (s.thresholds?.flowMinPercent ?? 85) / 100;
@@ -2893,6 +3325,8 @@ export default function VerdticalControlPanel() {
         const esLeve = !esGrave && sim.flowMeasured >= nominalFlow * flowMaxPct;
         const esEmbozo = sim.flowMeasured < nominalFlow * flowMinPct;
         const porcentajeActual = Math.round((sim.flowMeasured / nominalFlow) * 100);
+        const ciclosFugaLeveNecesarios = Math.max(1, Math.round((fugaLeveHorasSostenidas * 3600) / 15));
+        const ciclosEmbozoNecesarios = Math.max(1, Math.round((embozoHorasSostenidas * 3600) / 15));
         if (!blockedByLeak && esGrave) {
           blockedByLeak = true;
           leaksDetectados.push({ id: s.id, name: s.name, flowMeasured: sim.flowMeasured, nominalFlow });
@@ -2901,7 +3335,11 @@ export default function VerdticalControlPanel() {
             ...flowAlarmLog,
           ].slice(0, 100);
         }
-        if (esLeve && !minorLeakFlag) {
+        // La fuga leve y el embozo solo avisan si se mantienen de forma
+        // sostenida durante las horas configuradas (no ante una lectura
+        // puntual), igual que el resto de alarmas globales.
+        fugaLeveTicks = esLeve ? fugaLeveTicks + 1 : 0;
+        if (fugaLeveTicks >= ciclosFugaLeveNecesarios && !minorLeakFlag) {
           minorLeakFlag = true;
           fugasLeves.push({ id: s.id, name: s.name, flowMeasured: sim.flowMeasured, nominalFlow });
           flowAlarmLog = [
@@ -2911,7 +3349,8 @@ export default function VerdticalControlPanel() {
         } else if (!esLeve && !esGrave) {
           minorLeakFlag = false;
         }
-        if (esEmbozo && !clogFlag) {
+        embozoTicks = esEmbozo ? embozoTicks + 1 : 0;
+        if (embozoTicks >= ciclosEmbozoNecesarios && !clogFlag) {
           clogFlag = true;
           embozosNuevos.push({ id: s.id, name: s.name, flowMeasured: sim.flowMeasured, nominalFlow });
           flowAlarmLog = [
@@ -3166,6 +3605,8 @@ export default function VerdticalControlPanel() {
         blockedByFault,
         minorLeakFlag,
         clogFlag,
+        fugaLeveTicks,
+        embozoTicks,
         humidityFlag,
         ecFlag,
         temperatureFlag,
@@ -3200,7 +3641,13 @@ export default function VerdticalControlPanel() {
     setCaudalGeneralMedido(caudalGeneralAhora);
 
     const caudalNoExplicado = Math.round((caudalGeneralAhora - sumaFlowLineas) * 10) / 10;
-    if (!maestraCerrada && caudalNoExplicado > 5) {
+    const ciclosRoturaNecesarios = Math.max(1, Math.round((roturaColectorHorasSostenidas * 3600) / 15));
+    if (caudalNoExplicado > roturaColectorLitrosHora) {
+      roturaColectorTicksRef.current += 1;
+    } else {
+      roturaColectorTicksRef.current = 0;
+    }
+    if (!maestraCerrada && roturaColectorTicksRef.current >= ciclosRoturaNecesarios) {
       const motivoTexto = `El caudalímetro general marca ${caudalNoExplicado} L/h que ninguna línea explica — indicio de rotura de tubería antes de las electroválvulas.`;
       setMaestraCerrada({ motivo: motivoTexto, ts: now.toISOString() });
       setAlarmHistory((prev) =>
@@ -3257,10 +3704,9 @@ export default function VerdticalControlPanel() {
     }
 
     // Registro de "horas sin presión": se anota el momento exacto (fecha + hora)
-    // en que la presión cae por debajo de 1,0 bar, una sola vez por caída (no
-    // se repite mientras se mantenga baja), para poder consultar después en
-    // qué día y a qué hora ocurrió cada corte.
-    if (nuevaPresion < 1.0) {
+    // en que la presión cae por debajo del umbral de "sin agua" configurado en
+    // Ajustes, una sola vez por caída (no se repite mientras se mantenga baja).
+    if (nuevaPresion < presionSinAgua) {
       if (!pressureOutageActiveRef.current) {
         pressureOutageActiveRef.current = true;
         setPressureOutageLog((prev) => [{ ts: now.toISOString(), value: nuevaPresion }, ...prev].slice(0, 200));
@@ -3421,13 +3867,21 @@ export default function VerdticalControlPanel() {
       );
     }
 
-    // Alerta de "varias líneas con incidencias a la vez": si 3 o más líneas
-    // presentan simultáneamente algún problema activo, sospechar de una causa
-    // común (presión, filtro, suministro) antes que de averías independientes.
+    // Alerta de "varias líneas con incidencias a la vez": si se supera el
+    // umbral configurado de líneas con problema simultáneo, de forma
+    // sostenida durante las horas configuradas, sospechar de una causa
+    // común (presión, filtro, suministro) antes que de averías
+    // independientes.
     const lineasConProblema = updated.filter(
       (s) => s.blockedByLeak || s.blockedByFault || s.minorLeakFlag || s.clogFlag || s.humidityFlag || s.ecFlag || s.temperatureFlag
     );
-    if (lineasConProblema.length >= 3 && !multiLineAlert) {
+    const ciclosMultiNecesarios = Math.max(1, Math.round((multiplesLineasHorasSostenidas * 3600) / 15));
+    if (lineasConProblema.length >= multiplesLineasUmbral) {
+      multiLineTicksRef.current += 1;
+    } else {
+      multiLineTicksRef.current = 0;
+    }
+    if (multiLineTicksRef.current >= ciclosMultiNecesarios && !multiLineAlert) {
       const nuevaAlertaMulti = {
         id: `alarm-${now.getTime()}-multi`,
         ts: now.toISOString(),
@@ -3447,7 +3901,7 @@ export default function VerdticalControlPanel() {
           ...h,
         ].slice(0, 20)
       );
-    } else if (lineasConProblema.length < 3 && multiLineAlert) {
+    } else if (lineasConProblema.length < multiplesLineasUmbral && multiLineAlert) {
       setMultiLineAlert(null);
     }
 
@@ -3455,39 +3909,71 @@ export default function VerdticalControlPanel() {
       setHistory((h) => [...eventosCombinados.reverse(), ...h].slice(0, 20));
     }
 
-    const presionFueraRango = nuevaPresion < 1.0 || nuevaPresion > 4.0;
-    if (presionFueraRango) {
-      pressureOutTicksRef.current += 1;
-    } else {
-      pressureOutTicksRef.current = 0;
-    }
-    if (pressureOutTicksRef.current >= 8 && !pressureAlert) {
-      const tipo = nuevaPresion < 1.0 ? "presion_baja" : "presion_alta";
-      const nuevaAlerta = { id: `alarm-${now.getTime()}-presion`, ts: now.toISOString(), lineName: "Red / suministro general", type: tipo, value: nuevaPresion };
-      setPressureAlert(nuevaAlerta);
-      setAlarmHistory((prev) => [nuevaAlerta, ...prev].slice(0, MAX_ALARM_LOG));
-      setHistory((h) =>
-        [
-          {
-            ts: now.toISOString(),
-            text: `ALERTA: presión de red sostenidamente ${nuevaPresion < 1.0 ? "baja" : "alta"} (${nuevaPresion} bar durante ≥2 min).`,
-          },
-          ...h,
-        ].slice(0, 20)
-      );
-    } else if (!presionFueraRango && pressureAlert) {
-      pressureOutTicksRef.current = 0;
+    // Cada zona de presión se vigila por separado, con su propio contador de
+    // ciclos y sus propias horas configuradas — "sin agua" puede avisar
+    // mucho antes que una simple presión baja o alta.
+    const enZonaSinAgua = nuevaPresion < presionSinAgua;
+    const enZonaBaja = !enZonaSinAgua && nuevaPresion < presionBaja;
+    const enZonaAlta = nuevaPresion > presionAlta;
+
+    pressureSinAguaTicksRef.current = enZonaSinAgua ? pressureSinAguaTicksRef.current + 1 : 0;
+    pressureBajaTicksRef.current = enZonaBaja ? pressureBajaTicksRef.current + 1 : 0;
+    pressureAltaTicksRef.current = enZonaAlta ? pressureAltaTicksRef.current + 1 : 0;
+
+    // El reloj de simulación se actualiza cada 15 segundos, así que
+    // convertimos las horas configuradas de cada zona a número de ciclos.
+    const ciclosSinAguaNecesarios = Math.max(1, Math.round((presionHorasSinAgua * 3600) / 15));
+    const ciclosBajaNecesarios = Math.max(1, Math.round((presionHorasBaja * 3600) / 15));
+    const ciclosAltaNecesarios = Math.max(1, Math.round((presionHorasAlta * 3600) / 15));
+
+    if (!pressureAlert) {
+      let tipo = null;
+      let horasUsadas = null;
+      if (pressureSinAguaTicksRef.current >= ciclosSinAguaNecesarios) {
+        tipo = "sin_agua_red";
+        horasUsadas = presionHorasSinAgua;
+      } else if (pressureBajaTicksRef.current >= ciclosBajaNecesarios) {
+        tipo = "presion_baja";
+        horasUsadas = presionHorasBaja;
+      } else if (pressureAltaTicksRef.current >= ciclosAltaNecesarios) {
+        tipo = "presion_alta";
+        horasUsadas = presionHorasAlta;
+      }
+      if (tipo) {
+        const nuevaAlerta = {
+          id: `alarm-${now.getTime()}-presion`,
+          ts: now.toISOString(),
+          lineName: "Red / suministro general",
+          type: tipo,
+          value: nuevaPresion,
+          umbralSinAgua: presionSinAgua,
+          umbralBaja: presionBaja,
+          umbralAlta: presionAlta,
+        };
+        setPressureAlert(nuevaAlerta);
+        setAlarmHistory((prev) => [nuevaAlerta, ...prev].slice(0, MAX_ALARM_LOG));
+        setHistory((h) =>
+          [
+            {
+              ts: now.toISOString(),
+              text: `ALERTA: presión de red sostenidamente ${
+                tipo === "sin_agua_red" ? "sin agua" : tipo === "presion_baja" ? "baja" : "alta"
+              } (${nuevaPresion} bar durante ≥${horasUsadas} h).`,
+            },
+            ...h,
+          ].slice(0, 20)
+        );
+      }
     }
 
     const totalFlow = sumaFlowLineas;
     setFlowHistory((h) => [...h, { label, value: totalFlow }].slice(-MAX_PUNTOS_GRAFICA));
     setPressureHistory((h) => [...h, { label, value: nuevaPresion }].slice(-MAX_PUNTOS_GRAFICA));
 
-    // Consumo del depósito de fertilizante: proporcional al agua dosificada
-    // (dosis típica ≈ 1 mL de fertilizante por litro de agua), sobre un
-    // depósito de referencia de 20 L (20.000 mL).
-    const TANQUE_ML = 20000;
-    const DOSIS_ML_POR_LITRO = 1;
+    // Consumo del depósito de fertilizante: proporcional al agua dosificada,
+    // según la dosis y el tamaño de depósito configurados en Ajustes.
+    const TANQUE_ML = Math.max(1, Number(fertilizerTanqueL) || 20) * 1000;
+    const DOSIS_ML_POR_LITRO = Number(fertilizerDosisMlPorLitro) || 0;
     const litrosEsteTick = totalFlow * (15 / 3600);
     const consumoML = litrosEsteTick * DOSIS_ML_POR_LITRO;
     const nuevoNivel = clamp(Math.round((fertilizerLevel - (consumoML / TANQUE_ML) * 100) * 10) / 10, 0, 100);
@@ -3504,12 +3990,47 @@ export default function VerdticalControlPanel() {
           },
         ].slice(-MAX_DIAS_HISTORICO)
       );
+      setFertilizerHourlyHistory((prev) =>
+        [
+          ...prev,
+          {
+            date: fechaAnterior,
+            label: new Date(fechaAnterior).toLocaleDateString("es-ES", { weekday: "short", day: "2-digit", month: "short" }),
+            hours: Array.isArray(fertilizerHourlyConsumption) ? fertilizerHourlyConsumption : Array(24).fill(0),
+          },
+        ].slice(-MAX_DIAS_HORARIO)
+      );
       setFertilizerConsumedToday(Math.round(consumoML * 10) / 10);
+      setFertilizerHourlyConsumption(
+        Array(24)
+          .fill(0)
+          .map((v, h) => (h === now.getHours() ? Math.round(consumoML * 10) / 10 : 0))
+      );
     } else {
       setFertilizerConsumedToday((prev) => Math.round((prev + consumoML) * 10) / 10);
+      setFertilizerHourlyConsumption((prev) => {
+        const base = Array.isArray(prev) ? prev : Array(24).fill(0);
+        const horaActualFert = now.getHours();
+        return base.map((v, h) => (h === horaActualFert ? Math.round((v + consumoML) * 10) / 10 : v));
+      });
     }
 
-    if (nuevoNivel < 5 && !fertilizerAlertedRef.current.agotado) {
+    // La alarma de fertilizante solo salta si el nivel se mantiene por
+    // debajo del umbral de forma continuada, durante las horas configuradas
+    // (no ante una lectura puntual, p.ej. justo tras una tanda larga).
+    const ciclosFertNecesarios = Math.max(1, Math.round((fertilizanteHorasSostenidas * 3600) / 15));
+    if (nuevoNivel < fertilizanteUmbralAgotado) {
+      fertilizerAgotadoTicksRef.current += 1;
+    } else {
+      fertilizerAgotadoTicksRef.current = 0;
+    }
+    if (nuevoNivel < fertilizanteUmbralBajo) {
+      fertilizerBajoTicksRef.current += 1;
+    } else {
+      fertilizerBajoTicksRef.current = 0;
+    }
+
+    if (fertilizerAgotadoTicksRef.current >= ciclosFertNecesarios && !fertilizerAlertedRef.current.agotado) {
       fertilizerAlertedRef.current = { bajo: true, agotado: true };
       const nuevaAlertaFert = {
         id: `alarm-${now.getTime()}-fert-agotado`,
@@ -3517,13 +4038,14 @@ export default function VerdticalControlPanel() {
         lineName: "Depósito de fertilizante",
         type: "fertilizante_agotado",
         value: nuevoNivel,
+        umbral: fertilizanteUmbralAgotado,
       };
       setFertilizerAlert(nuevaAlertaFert);
       setAlarmHistory((prev) => [nuevaAlertaFert, ...prev].slice(0, MAX_ALARM_LOG));
       setHistory((h) =>
         [{ ts: now.toISOString(), text: `ALERTA: depósito de fertilizante prácticamente agotado (${nuevoNivel}%).` }, ...h].slice(0, 20)
       );
-    } else if (nuevoNivel < 15 && !fertilizerAlertedRef.current.bajo) {
+    } else if (fertilizerBajoTicksRef.current >= ciclosFertNecesarios && !fertilizerAlertedRef.current.bajo) {
       fertilizerAlertedRef.current = { ...fertilizerAlertedRef.current, bajo: true };
       const nuevaAlertaFert = {
         id: `alarm-${now.getTime()}-fert-bajo`,
@@ -3531,6 +4053,7 @@ export default function VerdticalControlPanel() {
         lineName: "Depósito de fertilizante",
         type: "fertilizante_bajo",
         value: nuevoNivel,
+        umbral: fertilizanteUmbralBajo,
       };
       setFertilizerAlert((prev) => prev || nuevaAlertaFert);
       setAlarmHistory((prev) => [nuevaAlertaFert, ...prev].slice(0, MAX_ALARM_LOG));
@@ -3540,6 +4063,62 @@ export default function VerdticalControlPanel() {
   }, [now]);
 
   const [confirmReset, setConfirmReset] = useState(false);
+  const [confirmProgramarAuto, setConfirmProgramarAuto] = useState(false);
+  const [confirmBorrarHistorialRed, setConfirmBorrarHistorialRed] = useState(false);
+  const [confirmMantenimientoRealizado, setConfirmMantenimientoRealizado] = useState(false);
+  const [showCalendarioMantenimiento, setShowCalendarioMantenimiento] = useState(false);
+  // Coordenadas del puntero (ratón o dedo) relativas al lienzo de firma.
+  const posicionFirma = (e) => {
+    const canvas = firmaCanvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    return {
+      x: ((clientX - rect.left) / rect.width) * canvas.width,
+      y: ((clientY - rect.top) / rect.height) * canvas.height,
+    };
+  };
+  const firmaEmpezarTrazo = (e) => {
+    e.preventDefault();
+    const canvas = firmaCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const { x, y } = posicionFirma(e);
+    firmaDibujandoRef.current = true;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+  };
+  const firmaContinuarTrazo = (e) => {
+    if (!firmaDibujandoRef.current) return;
+    e.preventDefault();
+    const canvas = firmaCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const { x, y } = posicionFirma(e);
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "#1a1a1a";
+    ctx.lineTo(x, y);
+    ctx.stroke();
+  };
+  const firmaTerminarTrazo = () => {
+    firmaDibujandoRef.current = false;
+  };
+  const firmaBorrar = () => {
+    const canvas = firmaCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  };
+  const firmaGuardar = () => {
+    const canvas = firmaCanvasRef.current;
+    if (!canvas) return;
+    setFirmaDataUrl(canvas.toDataURL("image/png"));
+    setFirmaFecha(new Date().toISOString());
+  };
+
   const reiniciarPanel = async () => {
     try {
       await window.storage.delete(STORAGE_KEY);
@@ -3663,9 +4242,7 @@ export default function VerdticalControlPanel() {
     ].filter((l) => l !== "");
     const body = bodyLineas.join("\n");
     const destino = cliente.emailAvisos || cliente.email;
-    const enlace = document.createElement("a");
-    enlace.href = `mailto:${encodeURIComponent(destino)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-    enlace.click();
+    return `mailto:${destino}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
   };
 
   const rellenarFertilizante = () => {
@@ -3699,7 +4276,9 @@ export default function VerdticalControlPanel() {
 
   const descartarAlertaPresion = () => {
     setPressureAlert(null);
-    pressureOutTicksRef.current = 0;
+    pressureSinAguaTicksRef.current = 0;
+    pressureBajaTicksRef.current = 0;
+    pressureAltaTicksRef.current = 0;
   };
 
   const descartarAlertaMultiLinea = () => {
@@ -3756,8 +4335,34 @@ export default function VerdticalControlPanel() {
   };
 
   const [resumenProgramacionGlobal, setResumenProgramacionGlobal] = useState(null);
-  const [showListadoHorarios, setShowListadoHorarios] = useState(false);
   const [temporadaListado, setTemporadaListado] = useState(() => getSeasonForDate(now));
+
+  // Mientras haya alguna pantalla completa abierta (Plano, listado de
+  // horarios, informe y firma), bloqueamos el desplazamiento de la página de
+  // fondo, para que no aparezca un doble scroll (el de la pantalla y el de
+  // detrás a la vez).
+  // Al entrar en Plano, Listado de horarios o Informe y firma, cerramos
+  // cualquier desplegable que se hubiera quedado abierto en la pantalla
+  // anterior, para que no aparezca flotando por encima.
+  useEffect(() => {
+    if (pantallaActiva === "plano" || pantallaActiva === "listado" || pantallaActiva === "informe") {
+      setShowTecnicoConfig(false);
+      setShowClienteConfig(false);
+      setShowFertilizerHistory(false);
+      setShowRedHistory(false);
+      setShowLitrosChart(false);
+      setShowPresionChart(false);
+      setShowMantenimientoConfig(false);
+      setShowAlarmasGlobalesConfig(false);
+      setShowPruebasBox(false);
+      setShowUtilidadesBox(false);
+      setShowEtoConfig(false);
+      setShowDuracionTandaConfig(false);
+      setShowAlarmHistory(false);
+      setShowActivityLog(false);
+      setShowProyectoConfig(false);
+    }
+  }, [pantallaActiva]);
 
   // Calcula la programación automática de TODAS las líneas a la vez, en una
   // sola pasada: procesa una a una (en orden), y cada línea tiene en cuenta
@@ -3788,8 +4393,9 @@ export default function VerdticalControlPanel() {
         areaM2: s.areaM2,
         etoBase: etoLinea,
         nominalFlow: nominalFlowLinea,
-        duracionSesion: s.duracionTandaAuto ?? 15,
+        duracionSesion: s.duracionTandaAuto ?? 25,
         ocupacionPorEstacion: ocupacionAcumuladaPorEstacion,
+        factoresEstacionales,
       });
 
       ESTACIONES.forEach((est) => {
@@ -3860,9 +4466,13 @@ export default function VerdticalControlPanel() {
 
   const anyActive = mainSupply && !maestraCerrada && sectors.some((s) => isSectorActiveNow(s, now));
   const totalFlowMeasured = sectors.reduce((sum, s) => sum + Number(s.sensors?.flowMeasured || 0), 0);
-  const pressureOutOfRange = pressureBar < 1.0 || pressureBar > 4.0;
+  const pressureOutOfRange = pressureBar < presionBaja || pressureBar > presionAlta;
   const presionEnRangoTrabajo = pressureBar >= 1.8 && pressureBar <= 3.5;
   const todayTotalLiters = Math.round(sectors.reduce((sum, s) => sum + Number(s.sensors?.litersToday || 0), 0));
+  // Total consumido desde el inicio: suma de todo el histórico diario
+  // guardado (hasta 365 días) más lo que lleva hoy, que todavía no se ha
+  // cerrado como día completo en dailyConsumption.
+  const totalLitrosHistorico = Math.round(dailyConsumption.reduce((sum, d) => sum + Number(d.liters || 0), 0) + todayTotalLiters);
   const chartConsumoDiario = [...dailyConsumption, { label: "Hoy", liters: todayTotalLiters, isToday: true }];
   const chartConsumoReciente = chartConsumoDiario.slice(-14);
   const promedioPresionHoy =
@@ -3879,6 +4489,10 @@ export default function VerdticalControlPanel() {
   return (
     <div className="vc-root">
       <style>{`
+        html, body {
+          background: #12201f;
+          margin: 0;
+        }
         .vc-root {
           --vc-bg: #12201f;
           --vc-panel: #1b2b2a;
@@ -3955,6 +4569,10 @@ export default function VerdticalControlPanel() {
           border-color: var(--vc-red);
           color: var(--vc-red);
         }
+        .vc-bateria-badge {
+          border-color: var(--vc-amber);
+          color: var(--vc-amber);
+        }
         .vc-connection-dot {
           width: 7px;
           height: 7px;
@@ -4024,11 +4642,176 @@ export default function VerdticalControlPanel() {
           font-family: var(--vc-font-mono);
           font-size: 10px;
         }
+        .vc-informe-encabezado {
+          background: var(--vc-panel);
+          border: 1px solid var(--vc-border);
+          border-radius: 10px;
+          padding: 12px 14px;
+        }
+        .vc-informe-titulo-empresa {
+          font-weight: 700;
+          font-size: 14px;
+          margin-bottom: 8px;
+        }
+        .vc-informe-resumen {
+          display: grid;
+          grid-template-columns: repeat(4, 1fr);
+          gap: 8px;
+          margin-top: 10px;
+        }
+        .vc-informe-resumen-stat {
+          background: var(--vc-panel-2);
+          border: 1px solid var(--vc-border);
+          border-radius: 8px;
+          padding: 8px 4px;
+          text-align: center;
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
+        }
+        .vc-informe-resumen-valor {
+          font-family: var(--vc-font-mono);
+          font-size: 16px;
+          font-weight: 700;
+        }
+        .vc-informe-resumen-label {
+          font-size: 9px;
+          color: var(--vc-text-muted);
+          text-transform: uppercase;
+          letter-spacing: 0.03em;
+          margin-top: 2px;
+        }
+        .vc-informe-incidencias {
+          margin-top: 10px;
+          font-size: 12px;
+          padding: 8px 10px;
+          border-radius: 8px;
+          background: var(--vc-panel-2);
+          border: 1px solid var(--vc-border);
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
+        }
+        .vc-informe-consumo-tabla {
+          display: flex;
+          flex-direction: column;
+          gap: 5px;
+        }
+        .vc-informe-consumo-fila {
+          display: grid;
+          grid-template-columns: 90px 1fr 60px;
+          align-items: center;
+          gap: 8px;
+          font-size: 11px;
+        }
+        .vc-informe-consumo-nombre {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .vc-informe-consumo-barra-wrap {
+          background: var(--vc-panel-2);
+          border-radius: 4px;
+          height: 10px;
+          overflow: hidden;
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
+        }
+        .vc-informe-consumo-barra {
+          background: var(--vc-flow);
+          height: 100%;
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
+        }
+        .vc-informe-consumo-valor {
+          text-align: right;
+          font-family: var(--vc-font-mono);
+        }
+        .vc-informe-fertilizante {
+          margin-top: 10px;
+          font-size: 12px;
+        }
+        .vc-informe-fila {
+          display: flex;
+          justify-content: space-between;
+          flex-wrap: wrap;
+          gap: 8px;
+          font-size: 12px;
+          margin-bottom: 4px;
+        }
+        .vc-informe-procesos {
+          background: var(--vc-panel);
+          border: 1px solid var(--vc-border);
+          border-radius: 10px;
+          padding: 10px 14px;
+          font-size: 12px;
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+        }
+        .vc-firma-wrap {
+          background: #fff;
+          border: 1px dashed var(--vc-border);
+          border-radius: 10px;
+          padding: 4px;
+          display: flex;
+          justify-content: center;
+        }
+        .vc-firma-canvas {
+          width: 100%;
+          max-width: 500px;
+          height: 200px;
+          touch-action: none;
+          cursor: crosshair;
+          border-radius: 8px;
+        }
+        .vc-firma-botones {
+          display: flex;
+          gap: 8px;
+          margin-top: 8px;
+          flex-wrap: wrap;
+        }
+        .vc-firma-guardar-btn {
+          color: var(--vc-open);
+          border-color: var(--vc-open);
+        }
+        .vc-informe-solo-print {
+          display: none;
+        }
+        @media print {
+          body * {
+            visibility: hidden;
+          }
+          .vc-informe-print,
+          .vc-informe-print * {
+            visibility: visible;
+          }
+          .vc-informe-print {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+          }
+          .vc-informe-no-print {
+            display: none !important;
+          }
+          .vc-informe-solo-print {
+            display: block !important;
+          }
+        }
+        .vc-pantalla-secundaria {
+          background: var(--vc-panel);
+          border: 1px solid var(--vc-border);
+          border-radius: 14px;
+          padding: 20px;
+          margin-bottom: 1.25rem;
+        }
         .vc-plano-overlay {
           position: fixed;
-          inset: 0;
+          top: 0;
+          left: 0;
+          right: 0;
+          bottom: 72px;
           background: var(--vc-bg);
-          z-index: 200;
+          z-index: 50;
           overflow-y: auto;
           padding: 20px;
         }
@@ -4137,6 +4920,11 @@ export default function VerdticalControlPanel() {
           padding: 4px 10px;
           font-size: 11px;
           font-family: var(--vc-font-mono);
+        }
+        .vc-overlay-top-buttons {
+          margin-bottom: 14px;
+          padding-bottom: 14px;
+          border-bottom: 1px solid var(--vc-border);
         }
         .vc-plano-header {
           display: flex;
@@ -4272,6 +5060,13 @@ export default function VerdticalControlPanel() {
           margin-top: 18px;
           border-top: 1px solid var(--vc-border);
           padding-top: 16px;
+        }
+        .vc-programacion-params {
+          background: var(--vc-panel);
+          border: 1px solid var(--vc-border);
+          border-radius: 12px;
+          padding: 14px;
+          margin-bottom: 1.25rem;
         }
         .vc-balance-resultados {
           display: grid;
@@ -4418,6 +5213,14 @@ export default function VerdticalControlPanel() {
         }
         .vc-test-box {
           border-style: dashed;
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+        .vc-pruebas-aviso {
+          width: 100%;
+          margin: 0 0 8px;
+          color: var(--vc-amber);
         }
         .vc-box-separador {
           width: 1px;
@@ -4431,6 +5234,7 @@ export default function VerdticalControlPanel() {
         .vc-programacion-box {
           display: flex;
           align-items: center;
+          flex-wrap: wrap;
           gap: 4px;
           background: var(--vc-panel-2);
           border: 1px solid var(--vc-border);
@@ -4475,14 +5279,18 @@ export default function VerdticalControlPanel() {
         .vc-reset-confirm {
           display: flex;
           align-items: center;
+          flex-wrap: wrap;
           gap: 8px;
           background: #3a1616;
           border: 1px solid var(--vc-red);
-          border-radius: 999px;
+          border-radius: 16px;
           padding: 7px 14px;
           font-size: 11px;
           color: #ffd9d5;
-          white-space: nowrap;
+          white-space: normal;
+          max-width: 100%;
+          min-width: 0;
+          box-sizing: border-box;
         }
         .vc-reset-confirm-yes {
           background: var(--vc-red);
@@ -4632,11 +5440,37 @@ export default function VerdticalControlPanel() {
           gap: 10px;
           margin-bottom: 1.25rem;
         }
+        .vc-summary-row-3 {
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 6px;
+          position: relative;
+        }
+        .vc-alarm-dropdown-wrap.vc-dropdown-wrap-row {
+          position: static;
+        }
+        .vc-alarm-dropdown.vc-dropdown-centered {
+          left: 50%;
+          right: auto;
+          transform: translateX(-50%);
+          width: 100%;
+          max-width: 92vw;
+          max-height: none;
+          overflow-y: visible;
+        }
+        .vc-summary-row.vc-summary-row-full {
+          grid-template-columns: 1fr;
+        }
         .vc-tecnico-cliente-stack {
           display: flex;
-          flex-direction: column;
+          flex-direction: row;
+          flex-wrap: wrap;
           gap: 10px;
           min-width: 0;
+          position: relative;
+        }
+        .vc-tecnico-cliente-stack > .vc-alarm-dropdown-wrap {
+          flex: 1;
+          min-width: 120px;
         }
         .vc-summary-card {
           background: var(--vc-panel);
@@ -4654,6 +5488,38 @@ export default function VerdticalControlPanel() {
         .vc-summary-card-compact {
           padding: 6px 8px;
           gap: 5px;
+        }
+        .vc-tecnico-btn-alto {
+          padding: 28px 8px;
+          min-width: 0;
+          overflow: hidden;
+          box-sizing: border-box;
+        }
+        .vc-tecnico-btn-bajo {
+          padding: 12px 8px;
+        }
+        .vc-tecnico-btn-bajo .vc-tecnico-icono {
+          font-size: 32px;
+        }
+        .vc-tecnico-btn-alto .vc-summary-label {
+          font-size: 9px;
+          display: flex;
+          flex-direction: column;
+          flex-wrap: wrap;
+          align-items: center;
+          justify-content: center;
+          gap: 4px;
+          white-space: normal;
+          text-align: center;
+        }
+        .vc-tecnico-btn-alto .vc-summary-value {
+          white-space: normal;
+          word-break: break-word;
+          text-align: center;
+        }
+        .vc-tecnico-icono {
+          font-size: 60px;
+          line-height: 1;
         }
         .vc-summary-card-compact .vc-summary-label {
           font-size: 9px;
@@ -4684,12 +5550,20 @@ export default function VerdticalControlPanel() {
           gap: 4px;
           align-self: start;
         }
+        .vc-summary-icon-box {
+          height: 46px;
+          display: flex;
+          align-items: flex-end;
+          justify-content: center;
+        }
         .vc-summary-text-center {
           align-items: center;
           text-align: center;
         }
         .vc-summary-card-btn {
           width: 100%;
+          height: 100%;
+          box-sizing: border-box;
           font-family: inherit;
           cursor: pointer;
           text-align: left;
@@ -4712,6 +5586,16 @@ export default function VerdticalControlPanel() {
           font-family: var(--vc-font-mono);
           font-size: 18px;
         }
+        .vc-summary-value-sub {
+          font-size: 16px;
+          font-weight: 700;
+          color: var(--vc-text-muted);
+        }
+        .vc-estado-red-texto {
+          font-size: 12px;
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+        }
         .vc-collector-wrap {
           margin-bottom: 1.5rem;
         }
@@ -4733,11 +5617,15 @@ export default function VerdticalControlPanel() {
           border: 1px solid var(--vc-border);
           border-radius: 12px;
           padding: 12px 14px 4px;
+          min-width: 0;
+          box-sizing: border-box;
         }
         .vc-chart-title {
           display: flex;
           justify-content: space-between;
           align-items: baseline;
+          flex-wrap: wrap;
+          gap: 4px;
           font-size: 11px;
           text-transform: uppercase;
           letter-spacing: 0.05em;
@@ -4761,10 +5649,19 @@ export default function VerdticalControlPanel() {
           margin-top: 6px;
           margin-bottom: 4px;
         }
+        .vc-toggle-btn.vc-borrar-historial-btn {
+          color: var(--vc-red);
+          border-color: var(--vc-red);
+        }
         .vc-annual-chart-wrap {
           border-top: 1px solid var(--vc-border);
           padding-top: 8px;
           margin-top: 4px;
+        }
+        .vc-chart-clip {
+          width: 100%;
+          max-width: 100%;
+          overflow: hidden;
         }
         .vc-hourly-detail {
           border-top: 1px solid var(--vc-border);
@@ -5520,11 +6417,13 @@ export default function VerdticalControlPanel() {
           position: absolute;
           top: calc(100% + 6px);
           right: 0;
-          z-index: 20;
+          z-index: 30;
           width: 320px;
-          max-width: 80vw;
+          max-width: 92vw;
           max-height: 320px;
           overflow-y: auto;
+          overflow-x: hidden;
+          box-sizing: border-box;
           background: var(--vc-panel);
           border: 1px solid var(--vc-border);
           border-radius: 10px;
@@ -5640,7 +6539,8 @@ export default function VerdticalControlPanel() {
           color: var(--vc-text-muted);
         }
         .vc-tecnico-field input,
-        .vc-tecnico-field textarea {
+        .vc-tecnico-field textarea,
+        .vc-tecnico-field select {
           background: var(--vc-panel-2);
           border: 1px solid var(--vc-border);
           color: var(--vc-text);
@@ -5649,6 +6549,64 @@ export default function VerdticalControlPanel() {
           font-size: 12px;
           font-family: var(--vc-font-body);
           resize: vertical;
+        }
+        .vc-mantenimiento-box {
+          background: var(--vc-panel-2);
+          border: 1px solid var(--vc-border);
+          border-radius: 10px;
+          padding: 10px 12px;
+          margin: 4px 0;
+        }
+        .vc-mantenimiento-fecha {
+          font-size: 12px;
+          color: var(--vc-text);
+          margin-bottom: 8px;
+        }
+        .vc-mini-cal-grid-meses {
+          display: grid;
+          grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+          gap: 10px;
+          margin-top: 8px;
+        }
+        .vc-mini-cal-mes {
+          background: var(--vc-panel);
+          border: 1px solid var(--vc-border);
+          border-radius: 8px;
+          padding: 6px;
+        }
+        .vc-mini-cal-mes-nombre {
+          font-size: 10px;
+          text-transform: capitalize;
+          text-align: center;
+          color: var(--vc-text-muted);
+          margin-bottom: 4px;
+        }
+        .vc-mini-cal-grid {
+          display: grid;
+          grid-template-columns: repeat(7, 1fr);
+          gap: 1px;
+        }
+        .vc-mini-cal-dow {
+          font-size: 8px;
+          text-align: center;
+          color: var(--vc-text-muted);
+          padding-bottom: 2px;
+        }
+        .vc-mini-cal-dia {
+          font-size: 9px;
+          text-align: center;
+          padding: 2px 0;
+          border-radius: 3px;
+          color: var(--vc-text-muted);
+        }
+        .vc-mini-cal-dia-hoy {
+          border: 1px solid var(--vc-flow);
+          color: var(--vc-text);
+        }
+        .vc-mini-cal-dia-on {
+          background: var(--vc-violet);
+          color: #fff;
+          font-weight: 700;
         }
         .vc-tecnico-alarmas-title {
           font-size: 11px;
@@ -5694,9 +6652,85 @@ export default function VerdticalControlPanel() {
         @media (max-width: 480px) {
           .vc-root { padding: 1.1rem; }
           .vc-grid { grid-template-columns: 1fr; }
-          .vc-alarm-dropdown { right: auto; left: 0; width: 280px; }
+          .vc-alarm-dropdown { right: auto; left: 0; width: calc(100vw - 32px); max-width: calc(100vw - 32px); }
           .vc-mini-charts-grid { grid-template-columns: 1fr; }
+          .vc-charts-row { grid-template-columns: 1fr; }
           .vc-summary-row { grid-template-columns: repeat(2, 1fr); }
+          .vc-summary-row-3 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+          .vc-informe-resumen { grid-template-columns: repeat(2, 1fr); }
+          .vc-top-buttons {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 4px;
+            width: 100%;
+          }
+          .vc-co2-lineas-group {
+            display: contents;
+          }
+          .vc-connection-badge,
+          .vc-supply-toggle-lg {
+            padding: 5px 4px;
+            font-size: 9px;
+            min-height: 40px;
+            width: 100%;
+            max-width: none;
+            box-sizing: border-box;
+            justify-content: center;
+            white-space: normal;
+            text-overflow: clip;
+            line-height: 1.2;
+            gap: 2px;
+          }
+          .vc-supply-toggle-lg svg {
+            transform: scale(0.6);
+            margin: -6px -4px;
+          }
+          .vc-header-actions {
+            flex-wrap: nowrap;
+            overflow-x: auto;
+            justify-content: flex-start;
+            padding-bottom: 4px;
+          }
+          .vc-box-left {
+            margin-right: 0;
+          }
+        }
+        .vc-tabbar-spacer {
+          height: 72px;
+        }
+        .vc-tabbar {
+          position: fixed;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          z-index: 20;
+          display: flex;
+          background: var(--vc-panel);
+          border-top: 1px solid var(--vc-border);
+          padding: 6px 4px calc(6px + env(safe-area-inset-bottom, 0px));
+        }
+        .vc-tabbar-btn {
+          flex: 1;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 2px;
+          background: transparent;
+          border: none;
+          color: var(--vc-text-muted);
+          font-family: var(--vc-font-mono);
+          font-size: 10px;
+          padding: 6px 2px;
+          cursor: pointer;
+          border-radius: 10px;
+        }
+        .vc-tabbar-icon {
+          font-size: 20px;
+          line-height: 1;
+        }
+        .vc-tabbar-btn-on {
+          color: var(--vc-flow);
+          background: var(--vc-panel-2);
         }
       `}</style>
 
@@ -5721,6 +6755,16 @@ export default function VerdticalControlPanel() {
               <span className="vc-connection-dot" />
               {datosActivos ? "en línea" : "sin datos"}
             </div>
+            {plcSinCorriente && (
+              <div
+                className={
+                  bateriaPlcNivel <= bateriaUmbralBaja ? "vc-connection-badge vc-connection-badge-off" : "vc-connection-badge vc-bateria-badge"
+                }
+                title={`Batería de respaldo del PLC: ${bateriaPlcNivel}% — se está descargando porque no hay corriente en el PLC`}
+              >
+                🔋 {bateriaPlcNivel}%
+              </div>
+            )}
             <button
               className="vc-supply-toggle vc-supply-toggle-lg"
               onClick={() => setMainSupply((v) => !v)}
@@ -5730,22 +6774,15 @@ export default function VerdticalControlPanel() {
               sistema {mainSupply ? "activado" : "apagado"}
             </button>
             {(() => {
-              const consumosAyerTitulo = sectors.map((s) => consumoDeAyer(s, now));
-              const hayDatosAyerTitulo = consumosAyerTitulo.some((v) => v !== null);
-              const consumoAyerTotal = consumosAyerTitulo.reduce((sum, v) => sum + (v || 0), 0);
-              const co2Kg = Math.round(((consumoAyerTotal * wueGramosPorLitro * 0.45 * 3.667) / 1000) * 100) / 100;
+              const co2Kg = Math.round(((totalLitrosHistorico * wueGramosPorLitro * 0.45 * 3.667) / 1000) * 100) / 100;
               return (
                 <div className="vc-co2-lineas-group">
                   <div
                     className="vc-supply-toggle vc-supply-toggle-lg vc-co2-toggle"
-                    title={
-                      hayDatosAyerTitulo
-                        ? "Estimación orientativa de CO₂ capturado ayer — ver detalle y ajustar en el Plano"
-                        : "Todavía no hay un día completo de histórico; se mostrará una estimación real a partir de mañana — ver detalle en el Plano"
-                    }
+                    title="Estimación orientativa de CO₂ capturado en total, desde el histórico acumulado (hasta 365 días) — ver detalle y ajustar en el Plano"
                   >
                     <span style={{ fontSize: 20 }}>🌱</span>{" "}
-                    {hayDatosAyerTitulo ? `${co2Kg} kg CO₂ / día` : "0 kg CO₂ / día"}
+                    {co2Kg} kg CO₂ total
                   </div>
                   <div className="vc-supply-toggle vc-supply-toggle-lg vc-lineas-toggle" title="Número de líneas de riego configuradas">
                     💧 {sectors.length} líneas
@@ -5783,27 +6820,1429 @@ export default function VerdticalControlPanel() {
             </div>
           </div>
         )}
-        <div className="vc-header-actions">
-          <div className="vc-programacion-box">
-            <button
-              className="vc-icon-only-btn"
-              onClick={calcularProgramacionAutomaticaGlobal}
-              title="Programar automáticamente TODAS las líneas (según superficie, exposición y evapotranspiración de cada una, sin pisarse entre sí)"
-            >
-              🔄
-            </button>
-            <button
-              className="vc-icon-only-btn"
-              onClick={() => {
-                setTemporadaListado(getSeasonForDate(now));
-                setShowListadoHorarios(true);
-              }}
-              title="Ver listado de horarios de todas las líneas (con las que se cruzan entre sí, huecos libres, y total de actuaciones por línea)"
-            >
-              📋
+      </div>
+        {pantallaActiva === "programacion" && (
+          <div className="vc-tecnico-cliente-stack" style={{ marginBottom: "1.25rem" }}>
+            <div className="vc-alarm-dropdown-wrap vc-dropdown-wrap-row">
+              <button
+                className="vc-summary-card vc-summary-card-btn vc-summary-card-compact vc-tecnico-btn-alto vc-tecnico-btn-bajo"
+                onClick={() => setConfirmProgramarAuto(true)}
+                title="Programar automáticamente TODAS las líneas (según superficie, exposición y evapotranspiración de cada una, sin pisarse entre sí)"
+              >
+                <div className="vc-summary-text">
+                  <div className="vc-summary-label">
+                    <span className="vc-tecnico-icono">🔄</span> Programar auto
+                  </div>
+                </div>
+              </button>
+              {confirmProgramarAuto && (
+                <div className="vc-alarm-dropdown vc-dropdown-centered">
+                  <p className="vc-tecnico-hint" style={{ marginTop: 0 }}>
+                    ⚠ Esto va a recalcular y SUSTITUIR los horarios de TODAS las líneas, en las 4 estaciones, según los
+                    parámetros de abajo. ¿Continuar?
+                  </p>
+                  <div className="vc-reset-confirm">
+                    <button
+                      className="vc-reset-confirm-yes"
+                      onClick={() => {
+                        calcularProgramacionAutomaticaGlobal();
+                        setConfirmProgramarAuto(false);
+                      }}
+                    >
+                      sí, programar
+                    </button>
+                    <button className="vc-reset-confirm-no" onClick={() => setConfirmProgramarAuto(false)}>
+                      cancelar
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="vc-alarm-dropdown-wrap vc-dropdown-wrap-row">
+              <button
+                className="vc-summary-card vc-summary-card-btn vc-summary-card-compact vc-tecnico-btn-alto vc-tecnico-btn-bajo"
+                onClick={() => {
+                  setTemporadaListado(getSeasonForDate(now));
+                  setPantallaActiva("listado");
+                }}
+                title="Ver listado de horarios de todas las líneas (con las que se cruzan entre sí, huecos libres, y total de actuaciones por línea)"
+              >
+                <div className="vc-summary-text">
+                  <div className="vc-summary-label">
+                    <span className="vc-tecnico-icono">📋</span> Ver listado
+                  </div>
+                </div>
+              </button>
+            </div>
+          </div>
+        )}
+        {resumenProgramacionGlobal && (
+          <div className="vc-resumen-programacion-global">
+            ✅ {resumenProgramacionGlobal.lineasProgramadas} línea(s) programada(s) automáticamente, sin pisarse entre ellas.
+            {resumenProgramacionGlobal.sinSuperficie > 0 &&
+              ` ${resumenProgramacionGlobal.sinSuperficie} línea(s) sin superficie asignada en el Plano — se han dejado tal cual.`}
+            {resumenProgramacionGlobal.conflictosTotales > 0 &&
+              ` ⚠ ${resumenProgramacionGlobal.conflictosTotales} tanda(s) no encontraron hueco libre del todo — revísalas a mano.`}
+            <button className="vc-resumen-cerrar-btn" onClick={() => setResumenProgramacionGlobal(null)}>
+              ✕
             </button>
           </div>
-          <div className="vc-programacion-box">
+        )}
+        {pantallaActiva === "programacion" && (
+          <div className="vc-tecnico-cliente-stack" style={{ marginBottom: "1.25rem" }}>
+            <div className="vc-alarm-dropdown-wrap vc-dropdown-wrap-row" ref={etoDropdownRef}>
+              <button
+                className={showEtoConfig ? "vc-summary-card vc-summary-card-btn vc-summary-card-on vc-summary-card-compact" : "vc-summary-card vc-summary-card-btn vc-summary-card-compact"}
+                onClick={() => setShowEtoConfig((v) => !v)}
+              >
+                <div className="vc-summary-text">
+                  <div className="vc-summary-label">🌤️ Parámetros de programación</div>
+                  <div className="vc-summary-value">
+                    {etoSol}/{etoSemisombra}/{etoSombra} L/m²
+                  </div>
+                </div>
+              </button>
+              {showEtoConfig && (
+                <div className="vc-alarm-dropdown vc-dropdown-centered">
+                  <div className="vc-history-title" style={{ marginBottom: 4 }}>Parámetros para la programación automática</div>
+                  <p className="vc-tecnico-hint" style={{ marginTop: 0 }}>
+                    Estos valores son los que usa el botón 🔄 de arriba para calcular cuántas tandas y de cuánta duración
+                    le hacen falta a cada línea, en cada estación, según su superficie y su exposición (sol/semisombra/sombra,
+                    se configura en la tarjeta de cada línea).
+                  </p>
+                  <div className="vc-field-row">
+                    <label>
+                      ETo sol pleno (L/m²/día)
+                      <input type="number" step="0.1" value={etoSol} onChange={(e) => setEtoSol(Number(e.target.value))} />
+                    </label>
+                    <label>
+                      ETo semisombra (L/m²/día)
+                      <input
+                        type="number"
+                        step="0.1"
+                        value={etoSemisombra}
+                        onChange={(e) => setEtoSemisombra(Number(e.target.value))}
+                      />
+                    </label>
+                    <label>
+                      ETo sombra (L/m²/día)
+                      <input type="number" step="0.1" value={etoSombra} onChange={(e) => setEtoSombra(Number(e.target.value))} />
+                    </label>
+                  </div>
+                  <div className="vc-history-title" style={{ marginTop: 14, marginBottom: 4 }}>Necesidad hídrica por estación</div>
+                  <p className="vc-tecnico-hint" style={{ marginTop: 0 }}>
+                    El ETo de arriba es el de referencia (verano). Cada estación lo multiplica por este factor propio, para
+                    reflejar que en invierno las plantas necesitan mucha menos agua que en pleno verano. Por ejemplo, un
+                    factor de 0,3 en invierno significa que se riega solo el 30% de lo que se riega en verano.
+                  </p>
+                  <div className="vc-field-row">
+                    {ESTACIONES.map((est) => (
+                      <label key={est.key}>
+                        {est.label} (factor sobre el ETo)
+                        <input
+                          type="number"
+                          step="0.05"
+                          min="0"
+                          max="2"
+                          value={factoresEstacionales[est.key]}
+                          onChange={(e) =>
+                            setFactoresEstacionales({ ...factoresEstacionales, [est.key]: Number(e.target.value) })
+                          }
+                        />
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="vc-alarm-dropdown-wrap vc-dropdown-wrap-row" ref={duracionTandaDropdownRef}>
+              <button
+                className={
+                  showDuracionTandaConfig
+                    ? "vc-summary-card vc-summary-card-btn vc-summary-card-on vc-summary-card-compact"
+                    : "vc-summary-card vc-summary-card-btn vc-summary-card-compact"
+                }
+                onClick={() => setShowDuracionTandaConfig((v) => !v)}
+              >
+                <div className="vc-summary-text">
+                  <div className="vc-summary-label">⏱️ Duración de tanda</div>
+                  <div className="vc-summary-value">{sectors.length} líneas</div>
+                </div>
+              </button>
+              {showDuracionTandaConfig && (
+                <div className="vc-alarm-dropdown vc-dropdown-centered">
+                  <div className="vc-history-title" style={{ marginBottom: 4 }}>Duración de tanda por línea (minutos)</div>
+                  <div className="vc-riego-log">
+                    {sectors.map((s) => (
+                      <div className="vc-riego-log-item" key={s.id}>
+                        <span className="vc-riego-log-time">{s.name}</span>
+                        <span className="vc-riego-log-stats">
+                          {s.areaM2 ? `${s.areaM2} m² · ${s.exposicion || "sol"}` : "sin superficie asignada en el Plano"}
+                        </span>
+                        <input
+                          type="number"
+                          step="1"
+                          min="1"
+                          style={{ width: 60 }}
+                          value={s.duracionTandaAuto ?? 25}
+                          onChange={(e) => updateSector(s.id, { ...s, duracionTandaAuto: Number(e.target.value) })}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+      {maestraCerrada && (
+        <div className="vc-maestra-banner">
+          <div className="vc-maestra-titulo">⛔ Electroválvula maestra cerrada — rotura antes de las electroválvulas</div>
+          <p className="vc-maestra-motivo">{maestraCerrada.motivo}</p>
+          <p className="vc-maestra-hora">Ocurrió: {new Date(maestraCerrada.ts).toLocaleString("es-ES")}</p>
+          {!confirmRearmeMaestra ? (
+            <button className="vc-maestra-rearmar" onClick={() => setConfirmRearmeMaestra(true)}>
+              ✓ he revisado y reparado la avería — reabrir maestra
+            </button>
+          ) : (
+            <div className="vc-maestra-confirm">
+              <span>¿Confirmas que un técnico ha revisado y reparado la rotura? Se reabrirá la electroválvula maestra.</span>
+              <button
+                className="vc-maestra-confirm-yes"
+                onClick={() => {
+                  setMaestraCerrada(null);
+                  setConfirmRearmeMaestra(false);
+                }}
+              >
+                sí, reabrir
+              </button>
+              <button className="vc-maestra-confirm-no" onClick={() => setConfirmRearmeMaestra(false)}>
+                cancelar
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {anyActive && !presionEnRangoTrabajo && (
+        <div className="vc-leak-stack">
+          <div className="vc-leak-banner vc-leak-banner-pressure">
+            <span>
+              ℹ Hay líneas regando con la presión de red fuera del rango de trabajo (1,8–3,5 bar) — actual: {pressureBar} bar. Mientras
+              dure, el diagnóstico de embozo/fuga por línea queda en pausa: los emisores no entregan su caudal nominal por falta o exceso
+              de presión, no por avería. Comprueba primero la presión de cabezal.
+            </span>
+          </div>
+        </div>
+      )}
+
+      {pressureAlert && (
+        <div className="vc-leak-stack">
+          <div className="vc-leak-banner vc-leak-banner-pressure">
+            <span>
+              ⚠ Presión de red sostenidamente{" "}
+              {pressureAlert.type === "sin_agua_red" ? "sin agua" : pressureAlert.type === "presion_baja" ? "baja" : "alta"} (
+              {pressureAlert.value} bar durante ≥
+              {pressureAlert.type === "sin_agua_red" ? presionHorasSinAgua : pressureAlert.type === "presion_baja" ? presionHorasBaja : presionHorasAlta}{" "}
+              h) — no se ha aislado ninguna línea, revisar suministro/regulador.
+            </span>
+            <div className="vc-leak-actions">
+              {tecnico.alarmas?.presion !== false && (
+                <>
+                  <a className="vc-leak-notify" href={buildMailtoUrl(pressureAlert, tecnico)} title="Abrir correo con el aviso ya redactado">
+                    ✉ Avisar
+                  </a>
+                  {tecnico.telefono && (
+                    <a
+                      className="vc-leak-notify"
+                      href={buildWhatsappUrl(pressureAlert, tecnico)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title="Abrir WhatsApp con el aviso ya redactado"
+                    >
+                      💬 WhatsApp
+                    </a>
+                  )}
+                </>
+              )}
+              <button className="vc-leak-rearm" onClick={descartarAlertaPresion}>
+                Descartar aviso
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {multiLineAlert && (
+        <div className="vc-leak-stack">
+          <div className="vc-leak-banner vc-leak-banner-multi">
+            <span>
+              ⚠ {multiLineAlert.cantidad} líneas con incidencias a la vez ({multiLineAlert.lineas}) — sospecha primero de una causa
+              común (presión, filtro, suministro) antes de revisar cada línea por separado.
+            </span>
+            <div className="vc-leak-actions">
+              {tecnico.alarmas?.multiples_lineas !== false && (
+                <>
+                  <a className="vc-leak-notify" href={buildMailtoUrl(multiLineAlert, tecnico)} title="Abrir correo con el aviso ya redactado">
+                    ✉ Avisar
+                  </a>
+                  {tecnico.telefono && (
+                    <a
+                      className="vc-leak-notify"
+                      href={buildWhatsappUrl(multiLineAlert, tecnico)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title="Abrir WhatsApp con el aviso ya redactado"
+                    >
+                      💬 WhatsApp
+                    </a>
+                  )}
+                </>
+              )}
+              <button className="vc-leak-rearm" onClick={descartarAlertaMultiLinea}>
+                Descartar aviso
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {fertilizerAlert && (
+        <div className="vc-leak-stack">
+          <div className={fertilizerAlert.type === "fertilizante_agotado" ? "vc-leak-banner" : "vc-leak-banner vc-leak-banner-pressure"}>
+            <span>
+              {fertilizerAlert.type === "fertilizante_agotado" ? "⚠" : "ℹ"} Depósito de fertilizante{" "}
+              {fertilizerAlert.type === "fertilizante_agotado" ? "prácticamente agotado" : "bajo"} ({fertilizerLevel}%) — el riego sigue
+              funcionando con agua, pero sin dosificación efectiva.
+            </span>
+            <div className="vc-leak-actions">
+              {tecnico.alarmas?.fertilizante !== false && (
+                <>
+                  <a className="vc-leak-notify" href={buildMailtoUrl(fertilizerAlert, tecnico)} title="Abrir correo con el aviso ya redactado">
+                    ✉ Avisar
+                  </a>
+                  {tecnico.telefono && (
+                    <a
+                      className="vc-leak-notify"
+                      href={buildWhatsappUrl(fertilizerAlert, tecnico)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title="Abrir WhatsApp con el aviso ya redactado"
+                    >
+                      💬 WhatsApp
+                    </a>
+                  )}
+                </>
+              )}
+              <button className="vc-leak-rearm" onClick={rellenarFertilizante}>
+                Marcar como rellenado
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+
+      {pantallaActiva === "lineas" && (
+      <div className="vc-summary-row vc-summary-row-3">
+        <div className="vc-alarm-dropdown-wrap vc-dropdown-wrap-row" ref={litrosDropdownRef}>
+          <button
+            className="vc-summary-card vc-summary-card-narrow vc-summary-card-vertical vc-summary-card-btn"
+            onClick={() => setShowLitrosChart((v) => !v)}
+            title="Pulsa para ver la gráfica de consumo total"
+          >
+            <div className="vc-summary-icon-box">
+              <MiniAguaIcon active={anyActive} />
+            </div>
+            <div className="vc-summary-text vc-summary-text-center">
+              <div className="vc-summary-label">Litros T.</div>
+              <div
+                className="vc-summary-value vc-summary-value-sub"
+                style={{ color: anyActive ? "var(--vc-flow)" : "var(--vc-text-muted)" }}
+              >
+                {totalLitrosHistorico} L
+              </div>
+            </div>
+          </button>
+          {showLitrosChart && (
+            <div className="vc-alarm-dropdown vc-dropdown-centered">
+              <div className="vc-chart-title">
+                <span>Consumo total (L/día)</span>
+                <span className="vc-chart-current" style={{ color: "var(--vc-flow)" }}>
+                  {todayTotalLiters} L hoy
+                </span>
+              </div>
+              <DailyBarChart data={chartConsumoReciente} color="var(--vc-brass)" unit="L" />
+              <button className="vc-toggle-btn vc-annual-toggle" onClick={() => setShowAnnualWaterHistory((v) => !v)}>
+                {showAnnualWaterHistory ? "ocultar historial de 1 año" : `ver historial de 1 año (${chartConsumoDiario.length} días guardados)`}
+              </button>
+              {showAnnualWaterHistory && (
+                <div className="vc-annual-chart-wrap">
+                  <DailyBarChart
+                    data={ventanaDatos(chartConsumoDiario, waterAnnualOffset, VENTANA_DIAS_HISTORICO)}
+                    color="var(--vc-brass)"
+                    unit="L"
+                    height={280}
+                    onBarClick={(entry) => setSelectedGlobalConsumoDay(entry.date || "hoy")}
+                  />
+                  <ChartNavBar
+                    offset={waterAnnualOffset}
+                    setOffset={setWaterAnnualOffset}
+                    total={chartConsumoDiario.length}
+                    windowSize={VENTANA_DIAS_HISTORICO}
+                  />
+                  {selectedGlobalConsumoDay && (
+                    <div className="vc-hourly-detail">
+                      <div className="vc-hourly-detail-title">
+                        <span>
+                          Consumo por línea —{" "}
+                          {selectedGlobalConsumoDay === "hoy"
+                            ? "Hoy"
+                            : chartConsumoDiario.find((d) => d.date === selectedGlobalConsumoDay)?.label || selectedGlobalConsumoDay}
+                        </span>
+                        <button className="vc-cal-dia-cerrar-btn" onClick={() => setSelectedGlobalConsumoDay(null)}>
+                          ✕
+                        </button>
+                      </div>
+                      <DailyBarChart
+                        data={sectors.map((s) => {
+                          const entrada =
+                            selectedGlobalConsumoDay === "hoy"
+                              ? null
+                              : (s.dailyConsumption || []).find((d) => d.date === selectedGlobalConsumoDay);
+                          const liters =
+                            selectedGlobalConsumoDay === "hoy" ? s.sensors?.litersToday || 0 : entrada ? entrada.liters : 0;
+                          return { label: s.name, liters };
+                        })}
+                        color="var(--vc-flow)"
+                        unit="L"
+                        height={180}
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+        <div className="vc-alarm-dropdown-wrap vc-dropdown-wrap-row" ref={presionDropdownRef}>
+          <button
+            className="vc-summary-card vc-summary-card-narrow vc-summary-card-vertical vc-summary-card-btn"
+            onClick={() => setShowPresionChart((v) => !v)}
+            title="Pulsa para ver la gráfica de presión"
+          >
+            <div className="vc-summary-icon-box">
+              <PressureGauge
+                bar={pressureBar}
+                umbralSinAgua={presionSinAgua}
+                umbralBaja={presionBaja}
+                umbralAlta={presionAlta}
+                escalaMax={presionEscalaMax}
+              />
+            </div>
+            <div className="vc-summary-text vc-summary-text-center">
+              <div className="vc-summary-label">Presión red</div>
+              <div
+                className="vc-summary-value vc-summary-value-sub"
+                style={{ color: pressureOutOfRange ? "var(--vc-red)" : "var(--vc-amber)" }}
+              >
+                {pressureBar} bar
+              </div>
+            </div>
+          </button>
+          {showPresionChart && (
+            <div className="vc-alarm-dropdown vc-dropdown-centered">
+              <div className="vc-chart-title">
+                <span>Presión de red</span>
+                <span className="vc-chart-current" style={{ color: pressureOutOfRange ? "var(--vc-red)" : "var(--vc-amber)" }}>
+                  {pressureBar} bar
+                </span>
+              </div>
+              {chartPresionHoraria.length > 1 ? (
+                <div className="vc-chart-clip">
+                  <TrendChart data={chartPresionHoraria} color="var(--vc-amber)" unit="bar" dataKey="pressure" />
+                </div>
+              ) : (
+                <div className="vc-chart-empty">registrando datos…</div>
+              )}
+              <button className="vc-toggle-btn vc-annual-toggle" onClick={() => setShowAnnualPressureHistory((v) => !v)}>
+                {showAnnualPressureHistory
+                  ? "ocultar historial de 1 año"
+                  : `ver historial de 1 año (${chartPresionDiaria.length} días guardados)`}
+              </button>
+              {showAnnualPressureHistory && (
+                <div className="vc-annual-chart-wrap">
+                  <div className="vc-chart-clip">
+                    <TrendChart
+                      data={ventanaDatos(chartPresionDiaria, pressureAnnualOffset, VENTANA_DIAS_HISTORICO)}
+                      color="var(--vc-amber)"
+                      unit="bar"
+                      dataKey="avgPressure"
+                      height={280}
+                    />
+                  </div>
+                  <ChartNavBar
+                    offset={pressureAnnualOffset}
+                    setOffset={setPressureAnnualOffset}
+                    total={chartPresionDiaria.length}
+                    windowSize={VENTANA_DIAS_HISTORICO}
+                  />
+                  <div className="vc-outage-log">
+                    <div className="vc-outage-log-title">
+                      Horas sin presión registradas (&lt;1,0 bar) — {pressureOutageLog.length}
+                    </div>
+                    {pressureOutageLog.length === 0 ? (
+                      <div className="vc-chart-empty">sin caídas de presión registradas</div>
+                    ) : (
+                      pressureOutageLog.slice(0, 30).map((o, i) => (
+                        <div className="vc-outage-log-item" key={i}>
+                          <span>
+                            {new Date(o.ts).toLocaleDateString("es-ES", { weekday: "short", day: "2-digit", month: "short" })} ·{" "}
+                            {new Date(o.ts).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}
+                          </span>
+                          <span>{o.value} bar</span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+        <div className="vc-alarm-dropdown-wrap vc-dropdown-wrap-row" ref={redDropdownRef}>
+          <button
+            className="vc-summary-card vc-summary-card-narrow vc-summary-card-vertical vc-summary-card-btn"
+            onClick={() => setShowRedHistory((v) => !v)}
+            title="Electroválvula maestra: se cierra sola si hay indicio de rotura antes de las líneas. Pulsa para ver el historial."
+          >
+            <div className="vc-summary-icon-box">
+              <MiniAguaIcon active={anyActive} danger={!!maestraCerrada} />
+            </div>
+            <div className="vc-summary-text vc-summary-text-center">
+              <div
+                className="vc-summary-value vc-estado-red-texto"
+                style={{ color: maestraCerrada ? "var(--vc-red)" : anyActive ? "var(--vc-open)" : "var(--vc-text-muted)" }}
+              >
+                {maestraCerrada ? "MAESTRA CERRADA" : anyActive ? "regando" : "en reposo"}
+              </div>
+              <div
+                className="vc-summary-value vc-summary-value-sub"
+                style={{ color: maestraCerrada ? "var(--vc-red)" : anyActive ? "var(--vc-flow)" : "var(--vc-text-muted)" }}
+              >
+                {totalFlowMeasured} L/h
+              </div>
+            </div>
+          </button>
+          {showRedHistory && (
+            <div className="vc-alarm-dropdown vc-dropdown-centered">
+              <div className="vc-history-title">
+                Historial de la electroválvula maestra ({alarmHistory.filter((a) => a.type === "rotura_antes_electrovalvulas").length})
+              </div>
+              {alarmHistory.filter((a) => a.type === "rotura_antes_electrovalvulas").length === 0 ? (
+                <div className="vc-history-empty">sin incidencias registradas todavía</div>
+              ) : (
+                <>
+                  {alarmHistory
+                    .filter((a) => a.type === "rotura_antes_electrovalvulas")
+                    .map((a) => (
+                      <div className="vc-alarm-item vc-alarm-item-detected" key={a.id}>
+                        <div className="vc-alarm-item-row">
+                          <span>⛔ Rotura antes de las electroválvulas — {a.detalle}</span>
+                          <span>
+                            {new Date(a.ts).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  {!confirmBorrarHistorialRed ? (
+                    <button className="vc-toggle-btn vc-annual-toggle vc-borrar-historial-btn" onClick={() => setConfirmBorrarHistorialRed(true)}>
+                      🗑 borrar este historial
+                    </button>
+                  ) : (
+                    <div className="vc-reset-confirm" style={{ marginTop: 8 }}>
+                      <span>¿Borrar todo el historial de la electroválvula maestra?</span>
+                      <button
+                        className="vc-reset-confirm-yes"
+                        onClick={() => {
+                          setAlarmHistory((prev) => prev.filter((a) => a.type !== "rotura_antes_electrovalvulas"));
+                          setConfirmBorrarHistorialRed(false);
+                        }}
+                      >
+                        sí, borrar
+                      </button>
+                      <button className="vc-reset-confirm-no" onClick={() => setConfirmBorrarHistorialRed(false)}>
+                        cancelar
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </div>
+        <div className="vc-alarm-dropdown-wrap vc-dropdown-wrap-row" ref={fertilizerDropdownRef}>
+          <button
+            className={
+              showFertilizerHistory
+                ? "vc-summary-card vc-summary-card-btn vc-summary-card-on vc-summary-card-vertical vc-summary-card-narrow"
+                : "vc-summary-card vc-summary-card-btn vc-summary-card-vertical vc-summary-card-narrow"
+            }
+            onClick={() => setShowFertilizerHistory((v) => !v)}
+          >
+            <div className="vc-summary-icon-box">
+              <FertilizerGauge
+                level={fertilizerLevel}
+                consumiendo={mainSupply && !maestraCerrada && sectors.some((s) => isSectorActiveNow(s, now))}
+              />
+            </div>
+            <div className="vc-summary-text vc-summary-text-center">
+              <div className="vc-summary-label">Fertilizante</div>
+              <div
+                className="vc-summary-value vc-summary-value-sub"
+                style={{ color: fertilizerLevel < 5 ? "var(--vc-red)" : fertilizerLevel < 15 ? "var(--vc-amber)" : "var(--vc-violet)" }}
+              >
+                {fertilizerLevel}%
+              </div>
+            </div>
+          </button>
+          {showFertilizerHistory && (
+            <div className="vc-alarm-dropdown vc-fertilizer-dropdown vc-dropdown-centered">
+              <div className="vc-chart-title">
+                <span>Consumo de fertilizante (mL/día)</span>
+                <span className="vc-chart-current" style={{ color: "var(--vc-violet)" }}>
+                  {fertilizerConsumedToday} mL hoy
+                </span>
+              </div>
+              <div className="vc-chart-clip">
+                <DailyBarChart data={chartFertilizanteDiario} color="var(--vc-violet)" unit="mL" dataKey="consumoML" height={140} />
+              </div>
+              <button className="vc-toggle-btn vc-annual-toggle" onClick={() => setShowAnnualFertilizerHistory((v) => !v)}>
+                {showAnnualFertilizerHistory
+                  ? "ocultar historial de 1 año"
+                  : `ver historial de 1 año (${chartFertilizanteDiario.length} días guardados)`}
+              </button>
+              {showAnnualFertilizerHistory && (
+                <div className="vc-annual-chart-wrap">
+                  <div className="vc-chart-title" style={{ marginBottom: 6 }}>
+                    <span>Total consumido en este periodo</span>
+                    <span className="vc-chart-current" style={{ color: "var(--vc-violet)" }}>
+                      {Math.round(
+                        ventanaDatos(chartFertilizanteDiario, fertilizerAnnualOffset, VENTANA_DIAS_HISTORICO).reduce(
+                          (sum, d) => sum + Number(d.consumoML || 0),
+                          0
+                        )
+                      )}{" "}
+                      mL
+                    </span>
+                  </div>
+                  <div className="vc-chart-clip">
+                    <DailyBarChart
+                      data={ventanaDatos(chartFertilizanteDiario, fertilizerAnnualOffset, VENTANA_DIAS_HISTORICO)}
+                      color="var(--vc-violet)"
+                      unit="mL"
+                      dataKey="consumoML"
+                      height={200}
+                      onBarClick={(entry) => setSelectedFertilizerDay(entry.date || "hoy")}
+                    />
+                  </div>
+                  <ChartNavBar
+                    offset={fertilizerAnnualOffset}
+                    setOffset={setFertilizerAnnualOffset}
+                    total={chartFertilizanteDiario.length}
+                    windowSize={VENTANA_DIAS_HISTORICO}
+                  />
+                  {selectedFertilizerDay &&
+                    (() => {
+                      const esHoyFert = selectedFertilizerDay === "hoy";
+                      const diaHistFert = fertilizerHourlyHistory.find((d) => d.date === selectedFertilizerDay);
+                      const diaDiarioFert = fertilizerDailyHistory.find((d) => d.date === selectedFertilizerDay);
+                      const labelFert = esHoyFert ? "Hoy" : diaHistFert?.label || diaDiarioFert?.label || selectedFertilizerDay;
+                      const hayDatosFert = esHoyFert || !!diaHistFert;
+                      const horasFert = esHoyFert
+                        ? Array.isArray(fertilizerHourlyConsumption)
+                          ? fertilizerHourlyConsumption
+                          : Array(24).fill(0)
+                        : diaHistFert?.hours || Array(24).fill(0);
+                      const horasDelDiaFert = Array.from({ length: 24 }, (_, h) => `${String(h).padStart(2, "0")}h`);
+                      return (
+                        <div className="vc-hourly-detail">
+                          <div className="vc-hourly-detail-title">
+                            <span>Consumo por hora — {labelFert}</span>
+                            <button className="vc-cal-dia-cerrar-btn" onClick={() => setSelectedFertilizerDay(null)}>
+                              ✕
+                            </button>
+                          </div>
+                          {hayDatosFert ? (
+                            <div className="vc-chart-clip">
+                              <DailyBarChart
+                                data={horasDelDiaFert.map((h, i) => ({
+                                  label: h,
+                                  consumoML: horasFert[i],
+                                  isToday: esHoyFert && i === new Date().getHours(),
+                                }))}
+                                color="var(--vc-flow)"
+                                unit="mL"
+                                dataKey="consumoML"
+                                height={160}
+                                todayColor="var(--vc-violet)"
+                              />
+                            </div>
+                          ) : (
+                            <div className="vc-chart-empty">
+                              No hay detalle por hora guardado para este día (solo se conservan los últimos 14 días).
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+                  <div className="vc-chart-title" style={{ marginTop: 10 }}>
+                    <span>Total consumido — histórico completo ({chartFertilizanteDiario.length} días)</span>
+                    <span className="vc-chart-current" style={{ color: "var(--vc-violet)" }}>
+                      {Math.round(chartFertilizanteDiario.reduce((sum, d) => sum + Number(d.consumoML || 0), 0))} mL
+                    </span>
+                  </div>
+                </div>
+              )}
+              <div className="vc-fertilizer-level-row">
+                <span>Nivel del depósito</span>
+                <span
+                  style={{ color: fertilizerLevel < 5 ? "var(--vc-red)" : fertilizerLevel < 15 ? "var(--vc-amber)" : "var(--vc-violet)" }}
+                >
+                  {fertilizerLevel}%
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+      )}
+
+      {pantallaActiva === "ajustes" && (
+      <div className="vc-summary-row vc-summary-row-full">
+        <div className="vc-tecnico-cliente-stack">
+        <div className="vc-alarm-dropdown-wrap vc-dropdown-wrap-row" ref={tecnicoDropdownRef}>
+          <button
+            className={showTecnicoConfig ? "vc-summary-card vc-summary-card-btn vc-summary-card-on vc-summary-card-compact vc-tecnico-btn-alto" : "vc-summary-card vc-summary-card-btn vc-summary-card-compact vc-tecnico-btn-alto"}
+            onClick={() => setShowTecnicoConfig((v) => !v)}
+          >
+            <div className="vc-summary-text">
+              <div className="vc-summary-label">
+                <span className="vc-tecnico-icono">👷</span> Técnico
+              </div>
+              <div className="vc-summary-value">{tecnico.nombre ? tecnico.nombre : "sin definir"}</div>
+            </div>
+          </button>
+          {showTecnicoConfig && (
+            <div className="vc-alarm-dropdown vc-tecnico-form vc-dropdown-centered">
+              <div className="vc-history-title">Técnico de mantenimiento</div>
+              <p className="vc-tecnico-hint">
+                Estos datos se usan para preparar el correo o WhatsApp de cada alarma. El panel no envía avisos automáticamente: abre tu
+                app de correo/WhatsApp con el mensaje ya redactado para que lo confirmes y envíes tú.
+              </p>
+              <label className="vc-tecnico-field">
+                Nombre
+                <input
+                  type="text"
+                  value={tecnico.nombre}
+                  onChange={(e) => setTecnico({ ...tecnico, nombre: e.target.value })}
+                  placeholder="Nombre del técnico"
+                />
+              </label>
+              <label className="vc-tecnico-field">
+                Teléfono / WhatsApp
+                <input
+                  type="text"
+                  value={tecnico.telefono}
+                  onChange={(e) => setTecnico({ ...tecnico, telefono: e.target.value })}
+                  placeholder="+34 600 000 000"
+                />
+              </label>
+              <label className="vc-tecnico-field">
+                Email del técnico
+                <input
+                  type="email"
+                  value={tecnico.email}
+                  onChange={(e) => setTecnico({ ...tecnico, email: e.target.value })}
+                  placeholder="tecnico@ejemplo.com"
+                />
+              </label>
+              <label className="vc-tecnico-field">
+                Email de avisos (si es distinto)
+                <input
+                  type="email"
+                  value={tecnico.emailAvisos}
+                  onChange={(e) => setTecnico({ ...tecnico, emailAvisos: e.target.value })}
+                  placeholder="avisos@verdtical.com"
+                />
+              </label>
+              <div className="vc-tecnico-alarmas-title">Alarmas que quieres que le lleguen</div>
+              <div className="vc-tecnico-checks">
+                {CATEGORIAS_ALARMA.map((c) => (
+                  <label className="vc-tecnico-check" key={c.key}>
+                    <input
+                      type="checkbox"
+                      checked={tecnico.alarmas?.[c.key] !== false}
+                      onChange={(e) => setTecnico({ ...tecnico, alarmas: { ...tecnico.alarmas, [c.key]: e.target.checked } })}
+                    />
+                    {c.label}
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="vc-alarm-dropdown-wrap vc-dropdown-wrap-row" ref={clienteDropdownRef}>
+          <button
+            className={showClienteConfig ? "vc-summary-card vc-summary-card-btn vc-summary-card-on vc-summary-card-compact vc-tecnico-btn-alto" : "vc-summary-card vc-summary-card-btn vc-summary-card-compact vc-tecnico-btn-alto"}
+            onClick={() => setShowClienteConfig((v) => !v)}
+          >
+            <div className="vc-summary-text">
+              <div className="vc-summary-label">
+                <span className="vc-tecnico-icono">🧑</span> Cliente
+              </div>
+              <div className="vc-summary-value">{cliente.nombre ? cliente.nombre : "sin definir"}</div>
+            </div>
+          </button>
+          {showClienteConfig && (
+            <div className="vc-alarm-dropdown vc-tecnico-form vc-dropdown-centered">
+              <div className="vc-history-title">Cliente final</div>
+              <p className="vc-tecnico-hint">
+                Estos datos se usan para el informe de mantenimiento y para avisar al cliente de las alarmas que marques y de su
+                arreglo posterior. El panel no envía nada automáticamente: abre tu app de correo/WhatsApp con el mensaje ya redactado
+                para que lo confirmes y envíes tú.
+              </p>
+              <label className="vc-tecnico-field">
+                Nombre
+                <input
+                  type="text"
+                  value={cliente.nombre}
+                  onChange={(e) => setCliente({ ...cliente, nombre: e.target.value })}
+                  placeholder="Nombre del cliente"
+                />
+              </label>
+              <label className="vc-tecnico-field">
+                Teléfono / WhatsApp
+                <input
+                  type="text"
+                  value={cliente.telefono}
+                  onChange={(e) => setCliente({ ...cliente, telefono: e.target.value })}
+                  placeholder="+34 600 000 000"
+                />
+              </label>
+              <label className="vc-tecnico-field">
+                Email del cliente
+                <input
+                  type="email"
+                  value={cliente.email}
+                  onChange={(e) => setCliente({ ...cliente, email: e.target.value })}
+                  placeholder="cliente@ejemplo.com"
+                />
+              </label>
+              <label className="vc-tecnico-field">
+                Email de avisos (si es distinto)
+                <input
+                  type="email"
+                  value={cliente.emailAvisos}
+                  onChange={(e) => setCliente({ ...cliente, emailAvisos: e.target.value })}
+                  placeholder="avisos@cliente.com"
+                />
+              </label>
+              <div className="vc-tecnico-alarmas-title">Alarmas que quieres que le lleguen al cliente</div>
+              <div className="vc-tecnico-checks">
+                {CATEGORIAS_ALARMA.map((c) => (
+                  <label className="vc-tecnico-check" key={c.key}>
+                    <input
+                      type="checkbox"
+                      checked={cliente.alarmas?.[c.key] === true}
+                      onChange={(e) => setCliente({ ...cliente, alarmas: { ...cliente.alarmas, [c.key]: e.target.checked } })}
+                    />
+                    {c.label}
+                  </label>
+                ))}
+              </div>
+              <button
+                className="vc-cliente-copiar-btn"
+                onClick={() => {
+                  const datos = JSON.stringify({ nombre: cliente.nombre, email: cliente.email, telefono: cliente.telefono, emailAvisos: cliente.emailAvisos });
+                  navigator.clipboard.writeText(datos);
+                  setCopiadoCliente(true);
+                  setTimeout(() => setCopiadoCliente(false), 2000);
+                }}
+                disabled={!cliente.nombre && !cliente.email}
+              >
+                {copiadoCliente ? "✓ copiado" : "📋 copiar datos de cliente (para pegar en el mapa de proyectos)"}
+              </button>
+            </div>
+          )}
+        </div>
+        <div className="vc-alarm-dropdown-wrap vc-dropdown-wrap-row" ref={mantenimientoDropdownRef}>
+          <button
+            className={
+              showMantenimientoConfig
+                ? "vc-summary-card vc-summary-card-btn vc-summary-card-on vc-summary-card-compact vc-tecnico-btn-alto"
+                : "vc-summary-card vc-summary-card-btn vc-summary-card-compact vc-tecnico-btn-alto"
+            }
+            onClick={() => setShowMantenimientoConfig((v) => !v)}
+          >
+            <div className="vc-summary-text">
+              <div className="vc-summary-label">
+                <span className="vc-tecnico-icono">📅</span> Mantenimiento
+              </div>
+              <div className="vc-summary-value">
+                {cliente.proximoMantenimiento
+                  ? new Date(cliente.proximoMantenimiento).toLocaleDateString("es-ES", { day: "2-digit", month: "short" })
+                  : "sin programar"}
+              </div>
+            </div>
+          </button>
+          {showMantenimientoConfig && (
+            <div className="vc-alarm-dropdown vc-dropdown-centered">
+              <div className="vc-history-title">Día de mantenimiento</div>
+              <label className="vc-tecnico-field">
+                Frecuencia de mantenimiento contratada
+                <select
+                  value={cliente.frecuenciaMantenimiento || ""}
+                  onChange={(e) => setCliente({ ...cliente, frecuenciaMantenimiento: e.target.value })}
+                >
+                  <option value="">sin definir</option>
+                  <option value="mensual">Mensual</option>
+                  <option value="bimensual">Bimensual (cada 2 meses)</option>
+                  <option value="trimestral">Trimestral (cada 3 meses)</option>
+                  <option value="cuatrimestral">Cuatrimestral (cada 4 meses)</option>
+                  <option value="semestral">Semestral (cada 6 meses)</option>
+                </select>
+              </label>
+              {cliente.frecuenciaMantenimiento && (
+                <div className="vc-mantenimiento-box">
+                  <div className="vc-mantenimiento-fecha">
+                    📅 Próximo mantenimiento:{" "}
+                    <strong>
+                      {cliente.proximoMantenimiento
+                        ? new Date(cliente.proximoMantenimiento).toLocaleDateString("es-ES", {
+                            weekday: "long",
+                            day: "2-digit",
+                            month: "long",
+                            year: "numeric",
+                          })
+                        : "sin programar todavía"}
+                    </strong>
+                  </div>
+                  {!confirmMantenimientoRealizado ? (
+                    <button className="vc-toggle-btn vc-annual-toggle" onClick={() => setConfirmMantenimientoRealizado(true)}>
+                      ✓ mantenimiento realizado hoy
+                    </button>
+                  ) : (
+                    <div className="vc-reset-confirm">
+                      <span>¿Confirmas que has hecho hoy el mantenimiento? Se calculará la próxima fecha automáticamente.</span>
+                      <button
+                        className="vc-reset-confirm-yes"
+                        onClick={() => {
+                          const hoy = new Date();
+                          const proxima = calcularProximoMantenimiento(hoy, cliente.frecuenciaMantenimiento);
+                          setCliente({
+                            ...cliente,
+                            ultimoMantenimiento: hoy.toISOString(),
+                            proximoMantenimiento: proxima.toISOString(),
+                          });
+                          setConfirmMantenimientoRealizado(false);
+                        }}
+                      >
+                        sí, confirmar
+                      </button>
+                      <button className="vc-reset-confirm-no" onClick={() => setConfirmMantenimientoRealizado(false)}>
+                        cancelar
+                      </button>
+                    </div>
+                  )}
+                  <p className="vc-tecnico-hint" style={{ marginTop: 6, marginBottom: 0 }}>
+                    La fecha evita automáticamente fines de semana y festivos nacionales de España (no incluye festivos
+                    autonómicos ni locales).
+                  </p>
+                  {cliente.proximoMantenimiento && (
+                    <>
+                      <button
+                        className="vc-toggle-btn vc-annual-toggle"
+                        onClick={() => setShowCalendarioMantenimiento((v) => !v)}
+                        style={{ marginTop: 8 }}
+                      >
+                        {showCalendarioMantenimiento ? "ocultar calendario del año" : "📆 ver calendario del año"}
+                      </button>
+                      {showCalendarioMantenimiento &&
+                        (() => {
+                          const fechas = fechasMantenimientoDelAnio(new Date(cliente.proximoMantenimiento), cliente.frecuenciaMantenimiento);
+                          const anio = new Date().getFullYear();
+                          const diasPorMes = {};
+                          fechas.forEach((f) => {
+                            const m = f.getMonth();
+                            if (!diasPorMes[m]) diasPorMes[m] = [];
+                            diasPorMes[m].push(f.getDate());
+                          });
+                          return (
+                            <div className="vc-mini-cal-anio">
+                              <div className="vc-history-title" style={{ marginTop: 8 }}>
+                                Mantenimientos programados en {anio} ({fechas.length})
+                              </div>
+                              <div className="vc-mini-cal-grid-meses">
+                                {Array.from({ length: 12 }, (_, m) => (
+                                  <MiniCalendarMes key={m} anio={anio} mes={m} diasMarcados={diasPorMes[m] || []} />
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })()}
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+        <div className="vc-alarm-dropdown-wrap vc-dropdown-wrap-row">
+          <button
+            className="vc-summary-card vc-summary-card-btn vc-summary-card-compact vc-tecnico-btn-alto"
+            onClick={() => {
+              setPantallaActiva("informe");
+              // El lienzo todavía no existe en el DOM en este instante (la
+              // pantalla acaba de pedirse abrir), así que esperamos un
+              // momento antes de prepararlo: en blanco, o con la última
+              // firma guardada si ya había una.
+              setTimeout(() => {
+                const canvas = firmaCanvasRef.current;
+                if (!canvas) return;
+                const ctx = canvas.getContext("2d");
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = "#ffffff";
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                if (firmaDataUrl) {
+                  const img = new Image();
+                  img.onload = () => ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                  img.src = firmaDataUrl;
+                }
+              }, 50);
+            }}
+          >
+            <div className="vc-summary-text">
+              <div className="vc-summary-label">
+                <span className="vc-tecnico-icono">✍️</span> Informe y firma
+              </div>
+              <div className="vc-summary-value">{firmaFecha ? "firmado" : "sin firmar"}</div>
+            </div>
+          </button>
+        </div>
+        </div>
+      </div>
+      )}
+
+      {pantallaActiva === "programacion" && (
+      <div className="vc-alarm-dropdown-wrap" style={{ marginBottom: "1.25rem" }} ref={balanceHidricoDropdownRef}>
+        <button
+          className={showBalanceHidricoConfig ? "vc-summary-card vc-summary-card-btn vc-summary-card-on vc-summary-card-compact" : "vc-summary-card vc-summary-card-btn vc-summary-card-compact"}
+          onClick={() => setShowBalanceHidricoConfig((v) => !v)}
+        >
+          <div className="vc-summary-text">
+            <div className="vc-summary-label">🌿 Balance hídrico y CO₂</div>
+            <div className="vc-summary-value">WUE {wueGramosPorLitro} g/L</div>
+          </div>
+        </button>
+        {showBalanceHidricoConfig && (
+          <div className="vc-alarm-dropdown vc-dropdown-centered">
+            <div className="vc-history-title" style={{ marginBottom: 4 }}>Balance hídrico estimado</div>
+            <p className="vc-tecnico-hint" style={{ margin: 0 }}>
+              Compara el agua que realmente se ha regado hoy con la que las plantas necesitarían solo por
+              evapotranspiración, calculada línea a línea según su superficie y su exposición real (sol,
+              semisombra o sombra) — configúralas en la pestaña Plano. La diferencia es una estimación de
+              escorrentía o pérdida de agua (o de riego insuficiente, si sale negativa) — no un dato medido con
+              sensores de humedad de suelo, así que tómalo como orientativo. Los valores de ETo se ajustan en 📅
+              Programación → 🌤️ Parámetros de programación, y el umbral de aviso en 🔔 Configuración de alarmas.
+            </p>
+                <p className="vc-tecnico-hint">
+                  Este mismo cálculo se hace también línea a línea: si una línea concreta se desvía de su necesidad teórica más de
+                  este % (por exceso = posible escorrentía, o por defecto = posible riego insuficiente), aparecerá un aviso en su
+                  propia tarjeta, para identificar rápido cuál está mal ajustada. Se compara siempre con el día de AYER (ya
+                  completo), no con hoy — así no sale un falso aviso de déficit mientras el riego de hoy todavía está en marcha.
+                </p>
+                {(() => {
+                  const etoPorExposicion = { sol: etoSol, semisombra: etoSemisombra, sombra: etoSombra };
+                  const superficieTotal = sectors.reduce((sum, s) => sum + Number(s.areaM2 || 0), 0);
+                  const consumoTeorico =
+                    Math.round(
+                      sectors.reduce((sum, s) => sum + Number(s.areaM2 || 0) * (etoPorExposicion[s.exposicion] ?? etoSol), 0) * 10
+                    ) / 10;
+                  const consumosAyer = sectors.map((s) => consumoDeAyer(s, now));
+                  const hayDatosDeAyer = consumosAyer.some((v) => v !== null);
+                  const consumoReal = Math.round(consumosAyer.reduce((sum, v) => sum + (v || 0), 0) * 10) / 10;
+                  const diferencia = Math.round((consumoReal - consumoTeorico) * 10) / 10;
+                  if (!hayDatosDeAyer) {
+                    return (
+                      <div className="vc-balance-resultados">
+                        <div className="vc-balance-stat" style={{ gridColumn: "1 / -1" }}>
+                          <div className="vc-balance-stat-label">Todavía no hay un día completo de histórico — vuelve mañana</div>
+                        </div>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div className="vc-balance-resultados">
+                      <div className="vc-balance-stat">
+                        <div className="vc-balance-stat-label">Superficie total ({superficieTotal.toFixed(1)} m²)</div>
+                        <div className="vc-balance-stat-value">{consumoTeorico} L</div>
+                        <div className="vc-balance-stat-label" style={{ marginTop: 2 }}>necesidad teórica / día</div>
+                      </div>
+                      <div className="vc-balance-stat">
+                        <div className="vc-balance-stat-label">Regado real AYER</div>
+                        <div className="vc-balance-stat-value">{consumoReal} L</div>
+                      </div>
+                      <div className="vc-balance-stat">
+                        <div className="vc-balance-stat-label">
+                          {diferencia >= 0 ? "Posible escorrentía" : "Posible déficit de riego"}
+                        </div>
+                        <div
+                          className="vc-balance-stat-value"
+                          style={{ color: diferencia >= 0 ? "var(--vc-amber)" : "var(--vc-red)" }}
+                        >
+                          {diferencia >= 0 ? "+" : ""}
+                          {diferencia} L
+                        </div>
+                      </div>
+                      <div className="vc-balance-stat vc-balance-stat-co2">
+                        <div className="vc-balance-stat-label">CO₂ estimado capturado / día</div>
+                        <div className="vc-balance-stat-value">{Math.round(((consumoReal * wueGramosPorLitro * 0.45 * 3.667) / 1000) * 100) / 100} kg</div>
+                      </div>
+                    </div>
+                  );
+                })()}
+                <div className="vc-field-row" style={{ marginTop: 12 }}>
+                  <label>
+                    Eficiencia hídrica de la vegetación — WUE (g materia seca / L agua)
+                    <input
+                      type="number"
+                      step="0.1"
+                      value={wueGramosPorLitro}
+                      onChange={(e) => setWueGramosPorLitro(Number(e.target.value))}
+                    />
+                  </label>
+                </div>
+                <p className="vc-tecnico-hint">
+                  ⚠ El CO₂ es una ESTIMACIÓN muy orientativa, no una medición certificable: se calcula asumiendo que el ~45% de la
+                  materia seca producida es carbono, y que cada gramo de carbono equivale a 3,67 g de CO₂. La eficiencia hídrica
+                  (WUE) real varía enormemente según la especie concreta de cada planta (de 1 a más de 10 g/L) — el valor de arriba
+                  es un promedio genérico de vegetación ornamental, ajústalo si conoces mejor las especies de tu instalación.
+                </p>
+          </div>
+        )}
+      </div>
+      )}
+
+      {pantallaActiva === "programacion" && (
+      <div className="vc-alarm-dropdown-wrap" style={{ marginBottom: "1.25rem" }} ref={alarmasGlobalesDropdownRef}>
+        <button
+          className={
+            showAlarmasGlobalesConfig
+              ? "vc-summary-card vc-summary-card-btn vc-summary-card-on vc-summary-card-compact"
+              : "vc-summary-card vc-summary-card-btn vc-summary-card-compact"
+          }
+          onClick={() => setShowAlarmasGlobalesConfig((v) => !v)}
+        >
+          <div className="vc-summary-text">
+            <div className="vc-summary-label">🔔 Configuración de alarmas</div>
+            <div className="vc-summary-value">
+              {presionSinAgua}/{presionBaja}/{presionAlta} bar · Fert. {fertilizanteUmbralBajo}%/{fertilizanteUmbralAgotado}% ·{" "}
+              {multiplesLineasUmbral} líneas
+            </div>
+          </div>
+        </button>
+        {showAlarmasGlobalesConfig && (
+          <div className="vc-alarm-dropdown vc-dropdown-centered">
+            <div className="vc-history-title" style={{ marginBottom: 4 }}>Presión de red</div>
+            <p className="vc-tecnico-hint" style={{ marginTop: 0 }}>
+              Definen los tramos de color del manómetro (rojo/ámbar/azul) y cuándo se considera que la presión está fuera
+              de rango. Por debajo del primer valor: sin agua; entre el primero y el segundo: presión baja; entre el
+              segundo y el tercero: correcta; por encima del tercero: presión alta. La alarma solo salta si se mantiene
+              fuera de rango de forma continuada, durante las horas indicadas (no ante una caída puntual pasajera).
+            </p>
+            <div className="vc-field-row">
+              <label>
+                Sin agua por debajo de (bar)
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  value={presionSinAgua}
+                  onChange={(e) => setPresionSinAgua(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                Horas sostenidas — sin agua
+                <input
+                  type="number"
+                  step="0.5"
+                  min="0.5"
+                  value={presionHorasSinAgua}
+                  onChange={(e) => setPresionHorasSinAgua(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                Presión baja por debajo de (bar)
+                <input type="number" step="0.1" min="0" value={presionBaja} onChange={(e) => setPresionBaja(Number(e.target.value))} />
+              </label>
+              <label>
+                Horas sostenidas — presión baja
+                <input
+                  type="number"
+                  step="1"
+                  min="1"
+                  value={presionHorasBaja}
+                  onChange={(e) => setPresionHorasBaja(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                Presión alta por encima de (bar)
+                <input type="number" step="0.1" min="0" value={presionAlta} onChange={(e) => setPresionAlta(Number(e.target.value))} />
+              </label>
+              <label>
+                Horas sostenidas — presión alta
+                <input
+                  type="number"
+                  step="1"
+                  min="1"
+                  value={presionHorasAlta}
+                  onChange={(e) => setPresionHorasAlta(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                Tope de la escala del manómetro (bar)
+                <input
+                  type="number"
+                  step="0.5"
+                  min="1"
+                  value={presionEscalaMax}
+                  onChange={(e) => setPresionEscalaMax(Number(e.target.value))}
+                />
+              </label>
+            </div>
+            <div className="vc-history-title" style={{ marginTop: 14, marginBottom: 4 }}>Rotura antes del colector</div>
+            <p className="vc-tecnico-hint" style={{ marginTop: 0 }}>
+              A partir de cuántos L/h que ninguna línea explica (y durante cuánto tiempo sostenido) se cierra la
+              electroválvula maestra por indicio de rotura.
+            </p>
+            <div className="vc-field-row">
+              <label>
+                Caudal no explicado (L/h)
+                <input
+                  type="number"
+                  step="1"
+                  min="1"
+                  value={roturaColectorLitrosHora}
+                  onChange={(e) => setRoturaColectorLitrosHora(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                Horas sostenidas antes de cerrar la maestra
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0.01"
+                  value={roturaColectorHorasSostenidas}
+                  onChange={(e) => setRoturaColectorHorasSostenidas(Number(e.target.value))}
+                />
+              </label>
+            </div>
+            <div className="vc-history-title" style={{ marginTop: 14, marginBottom: 4 }}>Corte de corriente y batería del PLC</div>
+            <p className="vc-tecnico-hint" style={{ marginTop: 0 }}>
+              Cuánto dura la batería de respaldo desde el 100% hasta agotarse del todo, y a partir de qué nivel se avisa
+              de "batería baja" para dar tiempo a reaccionar antes de perder los datos por completo.
+            </p>
+            <div className="vc-field-row">
+              <label>
+                Autonomía de la batería (horas, 100%→0%)
+                <input
+                  type="number"
+                  step="0.5"
+                  min="0.5"
+                  value={bateriaAutonomiaHoras}
+                  onChange={(e) => setBateriaAutonomiaHoras(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                Avisar de batería baja por debajo de (%)
+                <input
+                  type="number"
+                  step="1"
+                  min="1"
+                  max="99"
+                  value={bateriaUmbralBaja}
+                  onChange={(e) => setBateriaUmbralBaja(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                Nivel actual de la batería (%)
+                <input type="number" step="1" min="0" max="100" value={bateriaPlcNivel} readOnly disabled />
+              </label>
+            </div>
+            <div className="vc-history-title" style={{ marginTop: 14, marginBottom: 4 }}>Fuga leve (goteo) y embozo</div>
+            <p className="vc-tecnico-hint" style={{ marginTop: 0 }}>
+              Cuánto tiempo sostenido hace falta para avisar de un posible goteo o de un posible embozo en cualquier
+              línea. Los porcentajes de caudal que definen cada caso siguen ajustándose por línea, dentro de cada tarjeta.
+            </p>
+            <div className="vc-field-row">
+              <label>
+                Horas sostenidas — fuga leve
+                <input
+                  type="number"
+                  step="0.25"
+                  min="0.25"
+                  value={fugaLeveHorasSostenidas}
+                  onChange={(e) => setFugaLeveHorasSostenidas(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                Horas sostenidas — embozo
+                <input
+                  type="number"
+                  step="0.25"
+                  min="0.25"
+                  value={embozoHorasSostenidas}
+                  onChange={(e) => setEmbozoHorasSostenidas(Number(e.target.value))}
+                />
+              </label>
+            </div>
+            <div className="vc-history-title" style={{ marginTop: 14, marginBottom: 4 }}>Fertilizante</div>
+            <p className="vc-tecnico-hint" style={{ marginTop: 0 }}>
+              Tamaño del depósito y dosis inyectada por litro de agua (para calcular el consumo), y a partir de qué nivel
+              se avisa de "nivel bajo" y de "prácticamente agotado".
+            </p>
+            <div className="vc-field-row">
+              <label>
+                Tamaño del depósito (L)
+                <input
+                  type="number"
+                  step="1"
+                  min="1"
+                  value={fertilizerTanqueL}
+                  onChange={(e) => setFertilizerTanqueL(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                Dosis (mL de fertilizante por litro de agua)
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  value={fertilizerDosisMlPorLitro}
+                  onChange={(e) => setFertilizerDosisMlPorLitro(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                Nivel bajo por debajo de (%)
+                <input
+                  type="number"
+                  step="1"
+                  min="1"
+                  max="100"
+                  value={fertilizanteUmbralBajo}
+                  onChange={(e) => setFertilizanteUmbralBajo(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                Prácticamente agotado por debajo de (%)
+                <input
+                  type="number"
+                  step="1"
+                  min="0"
+                  max="100"
+                  value={fertilizanteUmbralAgotado}
+                  onChange={(e) => setFertilizanteUmbralAgotado(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                Horas sostenidas antes de dar la alarma
+                <input
+                  type="number"
+                  step="0.5"
+                  min="0.5"
+                  value={fertilizanteHorasSostenidas}
+                  onChange={(e) => setFertilizanteHorasSostenidas(Number(e.target.value))}
+                />
+              </label>
+            </div>
+            <div className="vc-history-title" style={{ marginTop: 14, marginBottom: 4 }}>Balance hídrico por línea</div>
+            <p className="vc-tecnico-hint" style={{ marginTop: 0 }}>
+              Si una línea se desvía de su necesidad teórica (calculada por evapotranspiración, configurada en 📅
+              Programación → 🌤️ Parámetros de programación) más de este porcentaje, aparece un aviso en su propia
+              tarjeta — por exceso, posible escorrentía; por defecto, posible riego insuficiente. Se compara siempre con
+              el día de ayer, ya completo.
+            </p>
+            <div className="vc-field-row">
+              <label>
+                Umbral de aviso por línea (%)
+                <input
+                  type="number"
+                  step="1"
+                  value={umbralBalanceHidrico}
+                  onChange={(e) => setUmbralBalanceHidrico(Number(e.target.value))}
+                />
+              </label>
+            </div>
+            <div className="vc-history-title" style={{ marginTop: 14, marginBottom: 4 }}>Varias líneas a la vez</div>
+            <p className="vc-tecnico-hint" style={{ marginTop: 0 }}>
+              A partir de cuántas líneas con alguna incidencia activa a la vez se avisa de "varias líneas" — señal de una
+              posible causa común (presión, filtro, suministro) en vez de averías independientes.
+            </p>
+            <div className="vc-field-row">
+              <label>
+                Líneas simultáneas para avisar
+                <input
+                  type="number"
+                  step="1"
+                  min="2"
+                  value={multiplesLineasUmbral}
+                  onChange={(e) => setMultiplesLineasUmbral(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                Horas sostenidas antes de dar la alarma
+                <input
+                  type="number"
+                  step="0.25"
+                  min="0.25"
+                  value={multiplesLineasHorasSostenidas}
+                  onChange={(e) => setMultiplesLineasHorasSostenidas(Number(e.target.value))}
+                />
+              </label>
+            </div>
+            <p className="vc-tecnico-hint" style={{ marginTop: 14, marginBottom: 0 }}>
+              Las alarmas de humedad, CE, temperatura, embozo y fugas se configuran por línea (dentro de cada tarjeta, en
+              la pestaña 💧 Líneas), ya que cada línea puede necesitar valores distintos.
+            </p>
+          </div>
+        )}
+      </div>
+      )}
+
+        {pantallaActiva === "programacion" && (
+        <div className="vc-tecnico-cliente-stack" style={{ marginBottom: "1.25rem" }}>
+        <div className="vc-alarm-dropdown-wrap vc-dropdown-wrap-row" ref={utilidadesDropdownRef}>
+          <button
+            className={showUtilidadesBox ? "vc-summary-card vc-summary-card-btn vc-summary-card-on vc-summary-card-compact" : "vc-summary-card vc-summary-card-btn vc-summary-card-compact"}
+            onClick={() => setShowUtilidadesBox((v) => !v)}
+          >
+            <div className="vc-summary-text">
+              <div className="vc-summary-label">🛠️ Utilidades</div>
+              <div className="vc-summary-value">
+                reiniciar · alarmas {alarmHistory.length} · actividad {history.length}
+              </div>
+            </div>
+          </button>
+          {showUtilidadesBox && (
+          <div className="vc-alarm-dropdown vc-dropdown-centered vc-test-box">
+            <p className="vc-tecnico-hint vc-pruebas-aviso">
+              🔁 <strong>Reiniciar datos de ejemplo</strong>: borra todo lo configurado y vuelve a los datos de
+              demostración iniciales (⚠ acción irreversible, pide confirmación). 🔔 <strong>Alarmas</strong>: historial
+              completo de todas las alarmas que se han producido, con opción de avisar por correo/WhatsApp. 📝{" "}
+              <strong>Actividad</strong>: registro de los últimos eventos del panel (riegos, cambios, rearmes...).
+            </p>
             {!confirmReset ? (
               <button className="vc-icon-only-btn" onClick={() => setConfirmReset(true)} title="Reiniciar datos de ejemplo">
                 🔁
@@ -5928,7 +8367,26 @@ export default function VerdticalControlPanel() {
               )}
             </div>
           </div>
-          <div className="vc-programacion-box vc-test-box vc-box-left">
+          )}
+        </div>
+        <div className="vc-alarm-dropdown-wrap vc-dropdown-wrap-row" ref={pruebasDropdownRef}>
+          <button
+            className={showPruebasBox ? "vc-summary-card vc-summary-card-btn vc-summary-card-on vc-summary-card-compact" : "vc-summary-card vc-summary-card-btn vc-summary-card-compact"}
+            onClick={() => setShowPruebasBox((v) => !v)}
+          >
+            <div className="vc-summary-text">
+              <div className="vc-summary-label">🧪 Probar alarmas</div>
+              <div className="vc-summary-value">simular averías</div>
+            </div>
+          </button>
+          {showPruebasBox && (
+          <div className="vc-alarm-dropdown vc-dropdown-centered vc-test-box">
+            <p className="vc-tecnico-hint vc-pruebas-aviso">
+              ⚠ Antes de usar estos botones, configura primero todos los datos reales de tu instalación (umbrales de
+              alarmas, superficie y difusores de cada línea, técnico, cliente, fertilizante...). Estos botones simulan
+              averías directamente, sin pasar por los valores configurados — sirven para comprobar que cada aviso se ve
+              y se envía bien, no para calcular nada.
+            </p>
             <button
               className="vc-icon-only-btn"
               onClick={() => {
@@ -5987,17 +8445,25 @@ export default function VerdticalControlPanel() {
               💧⚠
             </button>
             <button
-              className="vc-icon-only-btn"
+              className={plcSinCorriente ? "vc-icon-only-btn vc-icon-only-btn-on" : "vc-icon-only-btn"}
               onClick={() => {
-                setMainSupply(false);
-                setAlarmHistory((prev) =>
-                  [
-                    { id: `alarm-plc-${Date.now()}`, ts: new Date().toISOString(), lineId: null, lineName: "Sistema general", type: "corte_corriente_plc" },
-                    ...prev,
-                  ].slice(0, MAX_ALARM_LOG)
-                );
+                const nuevoEstado = !plcSinCorriente;
+                setPlcSinCorriente(nuevoEstado);
+                if (nuevoEstado) {
+                  setMainSupply(false);
+                  setAlarmHistory((prev) =>
+                    [
+                      { id: `alarm-plc-${Date.now()}`, ts: new Date().toISOString(), lineId: null, lineName: "Sistema general", type: "corte_corriente_plc" },
+                      ...prev,
+                    ].slice(0, MAX_ALARM_LOG)
+                  );
+                }
               }}
-              title="🧪 Probar: corte de corriente en el PLC (apaga el sistema, sensores siguen)"
+              title={
+                plcSinCorriente
+                  ? "🧪 Pulsa de nuevo para simular que ha vuelto la corriente (la batería se recarga)"
+                  : "🧪 Probar: corte de corriente en el PLC (apaga el sistema; los sensores siguen mientras dure la batería)"
+              }
             >
               ⚡🔌
             </button>
@@ -6012,583 +8478,306 @@ export default function VerdticalControlPanel() {
             >
               🔋⚠
             </button>
-          </div>
-        </div>
-        {resumenProgramacionGlobal && (
-          <div className="vc-resumen-programacion-global">
-            ✅ {resumenProgramacionGlobal.lineasProgramadas} línea(s) programada(s) automáticamente, sin pisarse entre ellas.
-            {resumenProgramacionGlobal.sinSuperficie > 0 &&
-              ` ${resumenProgramacionGlobal.sinSuperficie} línea(s) sin superficie asignada en el Plano — se han dejado tal cual.`}
-            {resumenProgramacionGlobal.conflictosTotales > 0 &&
-              ` ⚠ ${resumenProgramacionGlobal.conflictosTotales} tanda(s) no encontraron hueco libre del todo — revísalas a mano.`}
-            <button className="vc-resumen-cerrar-btn" onClick={() => setResumenProgramacionGlobal(null)}>
-              ✕
-            </button>
-          </div>
-        )}
-      </div>
-
-      {maestraCerrada && (
-        <div className="vc-maestra-banner">
-          <div className="vc-maestra-titulo">⛔ Electroválvula maestra cerrada — rotura antes de las electroválvulas</div>
-          <p className="vc-maestra-motivo">{maestraCerrada.motivo}</p>
-          <p className="vc-maestra-hora">Ocurrió: {new Date(maestraCerrada.ts).toLocaleString("es-ES")}</p>
-          {!confirmRearmeMaestra ? (
-            <button className="vc-maestra-rearmar" onClick={() => setConfirmRearmeMaestra(true)}>
-              ✓ he revisado y reparado la avería — reabrir maestra
-            </button>
-          ) : (
-            <div className="vc-maestra-confirm">
-              <span>¿Confirmas que un técnico ha revisado y reparado la rotura? Se reabrirá la electroválvula maestra.</span>
-              <button
-                className="vc-maestra-confirm-yes"
-                onClick={() => {
-                  setMaestraCerrada(null);
-                  setConfirmRearmeMaestra(false);
-                }}
-              >
-                sí, reabrir
-              </button>
-              <button className="vc-maestra-confirm-no" onClick={() => setConfirmRearmeMaestra(false)}>
-                cancelar
-              </button>
-            </div>
-          )}
-        </div>
-      )}
-
-      {anyActive && !presionEnRangoTrabajo && (
-        <div className="vc-leak-stack">
-          <div className="vc-leak-banner vc-leak-banner-pressure">
-            <span>
-              ℹ Hay líneas regando con la presión de red fuera del rango de trabajo (1,8–3,5 bar) — actual: {pressureBar} bar. Mientras
-              dure, el diagnóstico de embozo/fuga por línea queda en pausa: los emisores no entregan su caudal nominal por falta o exceso
-              de presión, no por avería. Comprueba primero la presión de cabezal.
-            </span>
-          </div>
-        </div>
-      )}
-
-      {pressureAlert && (
-        <div className="vc-leak-stack">
-          <div className="vc-leak-banner vc-leak-banner-pressure">
-            <span>
-              ⚠ Presión de red sostenidamente {pressureAlert.type === "presion_baja" ? "baja" : "alta"} ({pressureAlert.value} bar
-              durante ≥2 min) — no se ha aislado ninguna línea, revisar suministro/regulador.
-            </span>
-            <div className="vc-leak-actions">
-              {tecnico.alarmas?.presion !== false && (
-                <>
-                  <a className="vc-leak-notify" href={buildMailtoUrl(pressureAlert, tecnico)} title="Abrir correo con el aviso ya redactado">
-                    ✉ Avisar
-                  </a>
-                  {tecnico.telefono && (
-                    <a
-                      className="vc-leak-notify"
-                      href={buildWhatsappUrl(pressureAlert, tecnico)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      title="Abrir WhatsApp con el aviso ya redactado"
-                    >
-                      💬 WhatsApp
-                    </a>
-                  )}
-                </>
-              )}
-              <button className="vc-leak-rearm" onClick={descartarAlertaPresion}>
-                Descartar aviso
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {multiLineAlert && (
-        <div className="vc-leak-stack">
-          <div className="vc-leak-banner vc-leak-banner-multi">
-            <span>
-              ⚠ {multiLineAlert.cantidad} líneas con incidencias a la vez ({multiLineAlert.lineas}) — sospecha primero de una causa
-              común (presión, filtro, suministro) antes de revisar cada línea por separado.
-            </span>
-            <div className="vc-leak-actions">
-              {tecnico.alarmas?.multiples_lineas !== false && (
-                <>
-                  <a className="vc-leak-notify" href={buildMailtoUrl(multiLineAlert, tecnico)} title="Abrir correo con el aviso ya redactado">
-                    ✉ Avisar
-                  </a>
-                  {tecnico.telefono && (
-                    <a
-                      className="vc-leak-notify"
-                      href={buildWhatsappUrl(multiLineAlert, tecnico)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      title="Abrir WhatsApp con el aviso ya redactado"
-                    >
-                      💬 WhatsApp
-                    </a>
-                  )}
-                </>
-              )}
-              <button className="vc-leak-rearm" onClick={descartarAlertaMultiLinea}>
-                Descartar aviso
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {fertilizerAlert && (
-        <div className="vc-leak-stack">
-          <div className={fertilizerAlert.type === "fertilizante_agotado" ? "vc-leak-banner" : "vc-leak-banner vc-leak-banner-pressure"}>
-            <span>
-              {fertilizerAlert.type === "fertilizante_agotado" ? "⚠" : "ℹ"} Depósito de fertilizante{" "}
-              {fertilizerAlert.type === "fertilizante_agotado" ? "prácticamente agotado" : "bajo"} ({fertilizerLevel}%) — el riego sigue
-              funcionando con agua, pero sin dosificación efectiva.
-            </span>
-            <div className="vc-leak-actions">
-              {tecnico.alarmas?.fertilizante !== false && (
-                <>
-                  <a className="vc-leak-notify" href={buildMailtoUrl(fertilizerAlert, tecnico)} title="Abrir correo con el aviso ya redactado">
-                    ✉ Avisar
-                  </a>
-                  {tecnico.telefono && (
-                    <a
-                      className="vc-leak-notify"
-                      href={buildWhatsappUrl(fertilizerAlert, tecnico)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      title="Abrir WhatsApp con el aviso ya redactado"
-                    >
-                      💬 WhatsApp
-                    </a>
-                  )}
-                </>
-              )}
-              <button className="vc-leak-rearm" onClick={rellenarFertilizante}>
-                Marcar como rellenado
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-
-      <div className="vc-summary-row">
-        <div className="vc-tecnico-cliente-stack">
-          <div className="vc-summary-card vc-summary-card-compact">
-            <div className="vc-summary-text">
-              <div className="vc-summary-label">Caudalímetro total</div>
-              <div className="vc-summary-value">{totalFlowMeasured} L/h</div>
-            </div>
-          </div>
-          <div className="vc-alarm-dropdown-wrap">
             <button
-              className={showPlano ? "vc-summary-card vc-summary-card-btn vc-summary-card-on vc-summary-card-compact" : "vc-summary-card vc-summary-card-btn vc-summary-card-compact"}
-              onClick={() => setShowPlano((v) => !v)}
+              className="vc-icon-only-btn"
+              onClick={() => {
+                setBateriaPlcNivel(Math.max(0, bateriaUmbralBaja - 1));
+                setAlarmHistory((prev) =>
+                  [
+                    {
+                      id: `alarm-bateria-${Date.now()}`,
+                      ts: new Date().toISOString(),
+                      lineId: null,
+                      lineName: "Batería del PLC",
+                      type: "bateria_baja",
+                      value: Math.max(0, bateriaUmbralBaja - 1),
+                      umbral: bateriaUmbralBaja,
+                    },
+                    ...prev,
+                  ].slice(0, MAX_ALARM_LOG)
+                );
+              }}
+              title="🧪 Probar: batería del PLC baja (por debajo del umbral configurado)"
             >
-              <div className="vc-summary-text">
-                <div className="vc-summary-label">🗺️ Plano</div>
-                <div className="vc-summary-value">
-                  {planoImagen ? `${sectors.filter((s) => s.posicionPlano).length}/${sectors.length} colocadas` : "sin subir"}
-                </div>
-              </div>
+              🔋📉
+            </button>
+            <button
+              className="vc-icon-only-btn"
+              onClick={() => {
+                if (!sectors || sectors.length === 0) return;
+                const linea = sectors.find((s) => !s.blockedByFault) || sectors[0];
+                setSectors((prev) => prev.map((s) => (s.id === linea.id ? { ...s, blockedByFault: true } : s)));
+                setAlarmHistory((prev) =>
+                  [
+                    { id: `alarm-${Date.now()}-${linea.id}`, ts: new Date().toISOString(), lineId: linea.id, lineName: linea.name, type: "fallo_electrico" },
+                    ...prev,
+                  ].slice(0, MAX_ALARM_LOG)
+                );
+              }}
+              title="🧪 Probar: fallo eléctrico de electroválvula (no responde, sin caudal)"
+            >
+              ⚡🚫
+            </button>
+            <button
+              className="vc-icon-only-btn"
+              onClick={() => {
+                if (!sectors || sectors.length === 0) return;
+                const linea = sectors[0];
+                const nominalFlow = Number(linea.emitters || 0) * Number(linea.emitterFlow || 0) || 100;
+                const flowMeasured = Math.round(nominalFlow * 1.3);
+                setAlarmHistory((prev) =>
+                  [
+                    {
+                      id: `alarm-${Date.now()}-${linea.id}`,
+                      ts: new Date().toISOString(),
+                      lineId: linea.id,
+                      lineName: linea.name,
+                      type: "fuga_leve",
+                      flowMeasured,
+                      nominalFlow,
+                    },
+                    ...prev,
+                  ].slice(0, MAX_ALARM_LOG)
+                );
+              }}
+              title="🧪 Probar: fuga leve (goteo, entre 115% y 150% del caudal nominal)"
+            >
+              💧🔸
+            </button>
+            <button
+              className="vc-icon-only-btn"
+              onClick={() => {
+                if (!sectors || sectors.length === 0) return;
+                const linea = sectors[0];
+                const nominalFlow = Number(linea.emitters || 0) * Number(linea.emitterFlow || 0) || 100;
+                const flowMeasured = Math.round(nominalFlow * 0.6);
+                setSectors((prev) => prev.map((s) => (s.id === linea.id ? { ...s, clogFlag: true } : s)));
+                setAlarmHistory((prev) =>
+                  [
+                    {
+                      id: `alarm-${Date.now()}-${linea.id}`,
+                      ts: new Date().toISOString(),
+                      lineId: linea.id,
+                      lineName: linea.name,
+                      type: "embozo",
+                      flowMeasured,
+                      nominalFlow,
+                    },
+                    ...prev,
+                  ].slice(0, MAX_ALARM_LOG)
+                );
+              }}
+              title="🧪 Probar: posible embozo (caudal por debajo del 85% del nominal)"
+            >
+              🚱
+            </button>
+            <button
+              className="vc-icon-only-btn"
+              onClick={() => {
+                if (!sectors || sectors.length === 0) return;
+                const linea = sectors[0];
+                setSectors((prev) => prev.map((s) => (s.id === linea.id ? { ...s, humidityFlag: true } : s)));
+                setAlarmHistory((prev) =>
+                  [
+                    {
+                      id: `alarm-${Date.now()}-${linea.id}`,
+                      ts: new Date().toISOString(),
+                      lineId: linea.id,
+                      lineName: linea.name,
+                      type: "humedad_fuera_rango",
+                      valor: 15,
+                      min: linea.thresholds?.humidityMin ?? 30,
+                      max: linea.thresholds?.humidityMax ?? 65,
+                    },
+                    ...prev,
+                  ].slice(0, MAX_ALARM_LOG)
+                );
+              }}
+              title="🧪 Probar: humedad de sustrato fuera de rango"
+            >
+              💧📉
+            </button>
+            <button
+              className="vc-icon-only-btn"
+              onClick={() => {
+                if (!sectors || sectors.length === 0) return;
+                const linea = sectors[0];
+                setSectors((prev) => prev.map((s) => (s.id === linea.id ? { ...s, ecFlag: true } : s)));
+                setAlarmHistory((prev) =>
+                  [
+                    {
+                      id: `alarm-${Date.now()}-${linea.id}`,
+                      ts: new Date().toISOString(),
+                      lineId: linea.id,
+                      lineName: linea.name,
+                      type: "ec_fuera_rango",
+                      valor: 3.2,
+                      min: linea.thresholds?.ecMin ?? 1.2,
+                      max: linea.thresholds?.ecMax ?? 2.4,
+                    },
+                    ...prev,
+                  ].slice(0, MAX_ALARM_LOG)
+                );
+              }}
+              title="🧪 Probar: conductividad (CE) fuera de rango"
+            >
+              🧂
+            </button>
+            <button
+              className="vc-icon-only-btn"
+              onClick={() => {
+                if (!sectors || sectors.length === 0) return;
+                const linea = sectors[0];
+                setSectors((prev) => prev.map((s) => (s.id === linea.id ? { ...s, temperatureFlag: true } : s)));
+                setAlarmHistory((prev) =>
+                  [
+                    {
+                      id: `alarm-${Date.now()}-${linea.id}`,
+                      ts: new Date().toISOString(),
+                      lineId: linea.id,
+                      lineName: linea.name,
+                      type: "temperatura_fuera_rango",
+                      valor: 42,
+                      min: linea.thresholds?.temperatureMin ?? 2,
+                      max: linea.thresholds?.temperatureMax ?? 40,
+                    },
+                    ...prev,
+                  ].slice(0, MAX_ALARM_LOG)
+                );
+              }}
+              title="🧪 Probar: temperatura fuera de rango"
+            >
+              🌡️⚠
+            </button>
+            <button
+              className="vc-icon-only-btn"
+              onClick={() => {
+                if (!sectors || sectors.length < 2) return;
+                const nombres = sectors.slice(0, 3).map((s) => s.name);
+                setAlarmHistory((prev) =>
+                  [
+                    {
+                      id: `alarm-multi-${Date.now()}`,
+                      ts: new Date().toISOString(),
+                      lineId: null,
+                      lineName: "Varias líneas",
+                      type: "multiples_lineas",
+                      cantidad: nombres.length,
+                      lineas: nombres.join(", "),
+                    },
+                    ...prev,
+                  ].slice(0, MAX_ALARM_LOG)
+                );
+              }}
+              title="🧪 Probar: varias líneas con incidencias a la vez"
+            >
+              🔀⚠
+            </button>
+            <button
+              className="vc-icon-only-btn"
+              onClick={() => {
+                setAlarmHistory((prev) =>
+                  [
+                    { id: `alarm-fert-${Date.now()}`, ts: new Date().toISOString(), lineId: null, lineName: "Depósito fertilizante", type: "fertilizante_bajo", value: 12 },
+                    ...prev,
+                  ].slice(0, MAX_ALARM_LOG)
+                );
+              }}
+              title="🧪 Probar: nivel de fertilizante bajo (por debajo del 15%)"
+            >
+              🧪📉
+            </button>
+            <button
+              className="vc-icon-only-btn"
+              onClick={() => {
+                setAlarmHistory((prev) =>
+                  [
+                    {
+                      id: `alarm-sinagua-${Date.now()}`,
+                      ts: new Date().toISOString(),
+                      lineId: null,
+                      lineName: "Red / suministro general",
+                      type: "sin_agua_red",
+                      value: Math.max(0, presionSinAgua - 0.2),
+                      umbralSinAgua: presionSinAgua,
+                      umbralBaja: presionBaja,
+                      umbralAlta: presionAlta,
+                    },
+                    ...prev,
+                  ].slice(0, MAX_ALARM_LOG)
+                );
+              }}
+              title="🧪 Probar: sin agua en la red (por debajo del umbral de sin agua)"
+            >
+              🚱💧
+            </button>
+            <button
+              className="vc-icon-only-btn"
+              onClick={() => {
+                setAlarmHistory((prev) =>
+                  [
+                    {
+                      id: `alarm-presion-baja-${Date.now()}`,
+                      ts: new Date().toISOString(),
+                      lineId: null,
+                      lineName: "Red / suministro general",
+                      type: "presion_baja",
+                      value: Math.max(0, presionBaja - 0.3),
+                      umbralBaja: presionBaja,
+                      umbralAlta: presionAlta,
+                    },
+                    ...prev,
+                  ].slice(0, MAX_ALARM_LOG)
+                );
+              }}
+              title="🧪 Probar: presión de red sostenidamente baja"
+            >
+              🌡️📉
+            </button>
+            <button
+              className="vc-icon-only-btn"
+              onClick={() => {
+                setAlarmHistory((prev) =>
+                  [
+                    {
+                      id: `alarm-presion-alta-${Date.now()}`,
+                      ts: new Date().toISOString(),
+                      lineId: null,
+                      lineName: "Red / suministro general",
+                      type: "presion_alta",
+                      value: presionAlta + 0.5,
+                      umbralBaja: presionBaja,
+                      umbralAlta: presionAlta,
+                    },
+                    ...prev,
+                  ].slice(0, MAX_ALARM_LOG)
+                );
+              }}
+              title="🧪 Probar: presión de red sostenidamente alta"
+            >
+              🌡️📈
             </button>
           </div>
-        </div>
-        <div className="vc-summary-card vc-summary-card-narrow vc-summary-card-vertical">
-          <PressureGauge bar={pressureBar} />
-          <div className="vc-summary-text vc-summary-text-center">
-            <div className="vc-summary-label">Presión red</div>
-            <div className="vc-summary-value" style={{ color: pressureOutOfRange ? "var(--vc-red)" : "var(--vc-text)" }}>
-              {pressureBar} bar
-            </div>
-          </div>
-        </div>
-        <div className="vc-alarm-dropdown-wrap" ref={redDropdownRef}>
-          <button
-            className="vc-summary-card vc-summary-card-narrow vc-summary-card-vertical vc-summary-card-btn"
-            onClick={() => setShowRedHistory((v) => !v)}
-            title="Electroválvula maestra: se cierra sola si hay indicio de rotura antes de las líneas. Pulsa para ver el historial."
-          >
-            <MiniAguaIcon active={anyActive} danger={!!maestraCerrada} />
-            <div className="vc-summary-text vc-summary-text-center">
-              <div className="vc-summary-label">Estado red</div>
-              <div className="vc-summary-value" style={{ color: maestraCerrada ? "var(--vc-red)" : anyActive ? "var(--vc-open)" : "var(--vc-text-muted)" }}>
-                {maestraCerrada ? "MAESTRA CERRADA" : anyActive ? "regando" : "en reposo"}
-              </div>
-            </div>
-          </button>
-          {showRedHistory && (
-            <div className="vc-alarm-dropdown">
-              <div className="vc-history-title">
-                Historial de la electroválvula maestra ({alarmHistory.filter((a) => a.type === "rotura_antes_electrovalvulas").length})
-              </div>
-              {alarmHistory.filter((a) => a.type === "rotura_antes_electrovalvulas").length === 0 ? (
-                <div className="vc-history-empty">sin incidencias registradas todavía</div>
-              ) : (
-                alarmHistory
-                  .filter((a) => a.type === "rotura_antes_electrovalvulas")
-                  .map((a) => (
-                    <div className="vc-alarm-item vc-alarm-item-detected" key={a.id}>
-                      <div className="vc-alarm-item-row">
-                        <span>⛔ Rotura antes de las electroválvulas — {a.detalle}</span>
-                        <span>
-                          {new Date(a.ts).toLocaleString("es-ES", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
-                        </span>
-                      </div>
-                    </div>
-                  ))
-              )}
-            </div>
-          )}
-        </div>
-        <div className="vc-tecnico-cliente-stack">
-        <div className="vc-alarm-dropdown-wrap" ref={tecnicoDropdownRef}>
-          <button
-            className={showTecnicoConfig ? "vc-summary-card vc-summary-card-btn vc-summary-card-on vc-summary-card-compact" : "vc-summary-card vc-summary-card-btn vc-summary-card-compact"}
-            onClick={() => setShowTecnicoConfig((v) => !v)}
-          >
-            <div className="vc-summary-text">
-              <div className="vc-summary-label">Técnico</div>
-              <div className="vc-summary-value">{tecnico.nombre ? tecnico.nombre : "sin definir"}</div>
-            </div>
-          </button>
-          {showTecnicoConfig && (
-            <div className="vc-alarm-dropdown vc-tecnico-form">
-              <div className="vc-history-title">Técnico de mantenimiento</div>
-              <p className="vc-tecnico-hint">
-                Estos datos se usan para preparar el correo o WhatsApp de cada alarma. El panel no envía avisos automáticamente: abre tu
-                app de correo/WhatsApp con el mensaje ya redactado para que lo confirmes y envíes tú.
-              </p>
-              <label className="vc-tecnico-field">
-                Nombre
-                <input
-                  type="text"
-                  value={tecnico.nombre}
-                  onChange={(e) => setTecnico({ ...tecnico, nombre: e.target.value })}
-                  placeholder="Nombre del técnico"
-                />
-              </label>
-              <label className="vc-tecnico-field">
-                Teléfono / WhatsApp
-                <input
-                  type="text"
-                  value={tecnico.telefono}
-                  onChange={(e) => setTecnico({ ...tecnico, telefono: e.target.value })}
-                  placeholder="+34 600 000 000"
-                />
-              </label>
-              <label className="vc-tecnico-field">
-                Email del técnico
-                <input
-                  type="email"
-                  value={tecnico.email}
-                  onChange={(e) => setTecnico({ ...tecnico, email: e.target.value })}
-                  placeholder="tecnico@ejemplo.com"
-                />
-              </label>
-              <label className="vc-tecnico-field">
-                Email de avisos (si es distinto)
-                <input
-                  type="email"
-                  value={tecnico.emailAvisos}
-                  onChange={(e) => setTecnico({ ...tecnico, emailAvisos: e.target.value })}
-                  placeholder="avisos@verdtical.com"
-                />
-              </label>
-              <div className="vc-tecnico-alarmas-title">Alarmas que quieres que le lleguen</div>
-              <div className="vc-tecnico-checks">
-                {CATEGORIAS_ALARMA.map((c) => (
-                  <label className="vc-tecnico-check" key={c.key}>
-                    <input
-                      type="checkbox"
-                      checked={tecnico.alarmas?.[c.key] !== false}
-                      onChange={(e) => setTecnico({ ...tecnico, alarmas: { ...tecnico.alarmas, [c.key]: e.target.checked } })}
-                    />
-                    {c.label}
-                  </label>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-        <div className="vc-alarm-dropdown-wrap" ref={clienteDropdownRef}>
-          <button
-            className={showClienteConfig ? "vc-summary-card vc-summary-card-btn vc-summary-card-on vc-summary-card-compact" : "vc-summary-card vc-summary-card-btn vc-summary-card-compact"}
-            onClick={() => setShowClienteConfig((v) => !v)}
-          >
-            <div className="vc-summary-text">
-              <div className="vc-summary-label">Cliente</div>
-              <div className="vc-summary-value">{cliente.nombre ? cliente.nombre : "sin definir"}</div>
-            </div>
-          </button>
-          {showClienteConfig && (
-            <div className="vc-alarm-dropdown vc-tecnico-form">
-              <div className="vc-history-title">Cliente final</div>
-              <p className="vc-tecnico-hint">
-                Estos datos se usan para el informe de mantenimiento y para avisar al cliente de las alarmas que marques y de su
-                arreglo posterior. El panel no envía nada automáticamente: abre tu app de correo/WhatsApp con el mensaje ya redactado
-                para que lo confirmes y envíes tú.
-              </p>
-              <label className="vc-tecnico-field">
-                Nombre
-                <input
-                  type="text"
-                  value={cliente.nombre}
-                  onChange={(e) => setCliente({ ...cliente, nombre: e.target.value })}
-                  placeholder="Nombre del cliente"
-                />
-              </label>
-              <label className="vc-tecnico-field">
-                Teléfono / WhatsApp
-                <input
-                  type="text"
-                  value={cliente.telefono}
-                  onChange={(e) => setCliente({ ...cliente, telefono: e.target.value })}
-                  placeholder="+34 600 000 000"
-                />
-              </label>
-              <label className="vc-tecnico-field">
-                Email del cliente
-                <input
-                  type="email"
-                  value={cliente.email}
-                  onChange={(e) => setCliente({ ...cliente, email: e.target.value })}
-                  placeholder="cliente@ejemplo.com"
-                />
-              </label>
-              <label className="vc-tecnico-field">
-                Email de avisos (si es distinto)
-                <input
-                  type="email"
-                  value={cliente.emailAvisos}
-                  onChange={(e) => setCliente({ ...cliente, emailAvisos: e.target.value })}
-                  placeholder="avisos@cliente.com"
-                />
-              </label>
-              <div className="vc-tecnico-alarmas-title">Alarmas que quieres que le lleguen al cliente</div>
-              <div className="vc-tecnico-checks">
-                {CATEGORIAS_ALARMA.map((c) => (
-                  <label className="vc-tecnico-check" key={c.key}>
-                    <input
-                      type="checkbox"
-                      checked={cliente.alarmas?.[c.key] === true}
-                      onChange={(e) => setCliente({ ...cliente, alarmas: { ...cliente.alarmas, [c.key]: e.target.checked } })}
-                    />
-                    {c.label}
-                  </label>
-                ))}
-              </div>
-              <div className="vc-tecnico-alarmas-title">Procesos realizados en esta visita</div>
-              <div className="vc-tecnico-checks">
-                {CATALOGO_PROCESOS_MANTENIMIENTO.map((p) => (
-                  <label className="vc-tecnico-check" key={p.key}>
-                    <input
-                      type="checkbox"
-                      checked={procesosRealizados[p.key] === true}
-                      onChange={(e) => setProcesosRealizados({ ...procesosRealizados, [p.key]: e.target.checked })}
-                    />
-                    {p.label}
-                  </label>
-                ))}
-              </div>
-              <label className="vc-tecnico-field">
-                Nota de observación
-                <textarea
-                  rows={2}
-                  value={notaObservacion}
-                  onChange={(e) => setNotaObservacion(e.target.value)}
-                  placeholder="Comentarios, incidencias vistas in situ, recomendaciones…"
-                />
-              </label>
-              <button className="vc-cliente-informe-btn" onClick={enviarInformeMantenimientoCliente} disabled={!cliente.email}>
-                ✉ enviar informe de mantenimiento ahora
-              </button>
-              {!cliente.email && <p className="vc-tecnico-hint" style={{ margin: 0 }}>añade un email para poder enviarlo</p>}
-              <button
-                className="vc-cliente-copiar-btn"
-                onClick={() => {
-                  const datos = JSON.stringify({ nombre: cliente.nombre, email: cliente.email, telefono: cliente.telefono, emailAvisos: cliente.emailAvisos });
-                  navigator.clipboard.writeText(datos);
-                  setCopiadoCliente(true);
-                  setTimeout(() => setCopiadoCliente(false), 2000);
-                }}
-                disabled={!cliente.nombre && !cliente.email}
-              >
-                {copiadoCliente ? "✓ copiado" : "📋 copiar datos de cliente (para pegar en el mapa de proyectos)"}
-              </button>
-            </div>
           )}
         </div>
         </div>
-        <div className="vc-alarm-dropdown-wrap" ref={fertilizerDropdownRef}>
-          <button
-            className={
-              showFertilizerHistory
-                ? "vc-summary-card vc-summary-card-btn vc-summary-card-on vc-summary-card-vertical vc-summary-card-narrow"
-                : "vc-summary-card vc-summary-card-btn vc-summary-card-vertical vc-summary-card-narrow"
-            }
-            onClick={() => setShowFertilizerHistory((v) => !v)}
-          >
-            <FertilizerGauge
-              level={fertilizerLevel}
-              consumiendo={mainSupply && !maestraCerrada && sectors.some((s) => isSectorActiveNow(s, now))}
-            />
-            <div className="vc-summary-text vc-summary-text-center">
-              <div className="vc-summary-label">Fertilizante</div>
-              <div
-                className="vc-summary-value"
-                style={{ color: fertilizerLevel < 5 ? "var(--vc-red)" : fertilizerLevel < 15 ? "var(--vc-amber)" : "var(--vc-text)" }}
-              >
-                {fertilizerLevel}%
-              </div>
-            </div>
-          </button>
-          {showFertilizerHistory && (
-            <div className="vc-alarm-dropdown vc-fertilizer-dropdown">
-              <div className="vc-chart-title">
-                <span>Consumo de fertilizante (mL/día)</span>
-                <span className="vc-chart-current" style={{ color: "var(--vc-violet)" }}>
-                  {fertilizerConsumedToday} mL hoy
-                </span>
-              </div>
-              <DailyBarChart data={chartFertilizanteDiario} color="var(--vc-violet)" unit="mL" dataKey="consumoML" height={140} />
-              <div className="vc-fertilizer-level-row">
-                <span>Nivel del depósito</span>
-                <span
-                  style={{ color: fertilizerLevel < 5 ? "var(--vc-red)" : fertilizerLevel < 15 ? "var(--vc-amber)" : "var(--vc-violet)" }}
-                >
-                  {fertilizerLevel}%
-                </span>
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
+      )}
 
+
+
+      {pantallaActiva === "lineas" && (
+      <>
       <div className="vc-collector-wrap">
         <CollectorFlow
           lines={sectors.map((s) => ({ name: s.name, active: mainSupply && !maestraCerrada && isSectorActiveNow(s, now) }))}
         />
       </div>
 
-      <div className="vc-charts-row">
-        <div className="vc-chart-card" style={{ gridColumn: showAnnualWaterHistory ? "1 / -1" : undefined }}>
-          <div className="vc-chart-title">
-            <span>Consumo total (L/día)</span>
-            <span className="vc-chart-current" style={{ color: "var(--vc-flow)" }}>
-              {todayTotalLiters} L hoy
-            </span>
-          </div>
-          <DailyBarChart data={chartConsumoReciente} color="var(--vc-brass)" unit="L" />
-          <button className="vc-toggle-btn vc-annual-toggle" onClick={() => setShowAnnualWaterHistory((v) => !v)}>
-            {showAnnualWaterHistory ? "ocultar historial de 1 año" : `ver historial de 1 año (${chartConsumoDiario.length} días guardados)`}
-          </button>
-          {showAnnualWaterHistory && (
-            <div className="vc-annual-chart-wrap">
-              <DailyBarChart
-                data={ventanaDatos(chartConsumoDiario, waterAnnualOffset, VENTANA_DIAS_HISTORICO)}
-                color="var(--vc-brass)"
-                unit="L"
-                height={280}
-                onBarClick={(entry) => setSelectedGlobalConsumoDay(entry.date || "hoy")}
-              />
-              <ChartNavBar
-                offset={waterAnnualOffset}
-                setOffset={setWaterAnnualOffset}
-                total={chartConsumoDiario.length}
-                windowSize={VENTANA_DIAS_HISTORICO}
-              />
-              {selectedGlobalConsumoDay && (
-                <div className="vc-hourly-detail">
-                  <div className="vc-hourly-detail-title">
-                    <span>
-                      Consumo por línea —{" "}
-                      {selectedGlobalConsumoDay === "hoy"
-                        ? "Hoy"
-                        : chartConsumoDiario.find((d) => d.date === selectedGlobalConsumoDay)?.label || selectedGlobalConsumoDay}
-                    </span>
-                    <button className="vc-cal-dia-cerrar-btn" onClick={() => setSelectedGlobalConsumoDay(null)}>
-                      ✕
-                    </button>
-                  </div>
-                  <DailyBarChart
-                    data={sectors.map((s) => {
-                      const entrada =
-                        selectedGlobalConsumoDay === "hoy"
-                          ? null
-                          : (s.dailyConsumption || []).find((d) => d.date === selectedGlobalConsumoDay);
-                      const liters =
-                        selectedGlobalConsumoDay === "hoy" ? s.sensors?.litersToday || 0 : entrada ? entrada.liters : 0;
-                      return { label: s.name, liters };
-                    })}
-                    color="var(--vc-flow)"
-                    unit="L"
-                    height={180}
-                  />
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-        <div className="vc-chart-card" style={{ gridColumn: showAnnualPressureHistory ? "1 / -1" : undefined }}>
-          <div className="vc-chart-title">
-            <span>Presión de red</span>
-            <span className="vc-chart-current" style={{ color: pressureOutOfRange ? "var(--vc-red)" : "var(--vc-amber)" }}>
-              {pressureBar} bar
-            </span>
-          </div>
-          {chartPresionHoraria.length > 1 ? (
-            <TrendChart data={chartPresionHoraria} color="var(--vc-amber)" unit="bar" dataKey="pressure" />
-          ) : (
-            <div className="vc-chart-empty">registrando datos…</div>
-          )}
-          <button className="vc-toggle-btn vc-annual-toggle" onClick={() => setShowAnnualPressureHistory((v) => !v)}>
-            {showAnnualPressureHistory
-              ? "ocultar historial de 1 año"
-              : `ver historial de 1 año (${chartPresionDiaria.length} días guardados)`}
-          </button>
-          {showAnnualPressureHistory && (
-            <div className="vc-annual-chart-wrap">
-              <TrendChart
-                data={ventanaDatos(chartPresionDiaria, pressureAnnualOffset, VENTANA_DIAS_HISTORICO)}
-                color="var(--vc-amber)"
-                unit="bar"
-                dataKey="avgPressure"
-                height={280}
-              />
-              <ChartNavBar
-                offset={pressureAnnualOffset}
-                setOffset={setPressureAnnualOffset}
-                total={chartPresionDiaria.length}
-                windowSize={VENTANA_DIAS_HISTORICO}
-              />
-              <div className="vc-outage-log">
-                <div className="vc-outage-log-title">
-                  Horas sin presión registradas (&lt;1,0 bar) — {pressureOutageLog.length}
-                </div>
-                {pressureOutageLog.length === 0 ? (
-                  <div className="vc-chart-empty">sin caídas de presión registradas</div>
-                ) : (
-                  pressureOutageLog.slice(0, 30).map((o, i) => (
-                    <div className="vc-outage-log-item" key={i}>
-                      <span>
-                        {new Date(o.ts).toLocaleDateString("es-ES", { weekday: "short", day: "2-digit", month: "short" })} ·{" "}
-                        {new Date(o.ts).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" })}
-                      </span>
-                      <span>{o.value} bar</span>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
+      </>
+      )}
 
-      {showPlano && (
-        <div className="vc-plano-overlay">
-          <div className="vc-plano-panel">
+      {pantallaActiva === "plano" && (
+        <div className="vc-pantalla-secundaria">
           <div className="vc-plano-header">
             <div>
               <div className="vc-history-title" style={{ marginBottom: 4 }}>Plano del proyecto</div>
@@ -6598,13 +8787,24 @@ export default function VerdticalControlPanel() {
               </p>
             </div>
             <div className="vc-plano-header-actions">
+              {planoImagen && (
+                <button
+                  className={showPlanoImagen ? "vc-cliente-copiar-btn vc-summary-card-on" : "vc-cliente-copiar-btn"}
+                  onClick={() => setShowPlanoImagen((v) => !v)}
+                >
+                  {showPlanoImagen ? "🗺️ ocultar plano" : "🗺️ ver plano"}
+                </button>
+              )}
               <label className="vc-cliente-copiar-btn" style={{ cursor: "pointer" }}>
                 {planoImagen ? "cambiar imagen" : "📐 subir plano o foto"}
                 <input
                   type="file"
                   accept="image/*"
                   style={{ display: "none" }}
-                  onChange={(e) => subirPlano(e.target.files?.[0])}
+                  onChange={(e) => {
+                    subirPlano(e.target.files?.[0]);
+                    setShowPlanoImagen(true);
+                  }}
                 />
               </label>
               {planoImagen && (
@@ -6612,7 +8812,7 @@ export default function VerdticalControlPanel() {
                   quitar imagen
                 </button>
               )}
-              <button className="vc-plano-cerrar-btn" onClick={() => { setShowPlano(false); setLineaColocando(null); }}>
+              <button className="vc-plano-cerrar-btn" onClick={() => { setPantallaActiva("lineas"); setLineaColocando(null); }}>
                 ✕ cerrar
               </button>
             </div>
@@ -6620,6 +8820,10 @@ export default function VerdticalControlPanel() {
 
           {!planoImagen ? (
             <div className="vc-chart-empty">Todavía no has subido ningún plano.</div>
+          ) : !showPlanoImagen ? (
+            <div className="vc-chart-empty">
+              Plano guardado — pulsa "🗺️ ver plano" arriba para mostrarlo y colocar las líneas.
+            </div>
           ) : (
             <>
               <div style={{ textAlign: "center" }}>
@@ -6715,134 +8919,253 @@ export default function VerdticalControlPanel() {
                         <option value="sombra">☁ sombra</option>
                       </select>
                     </div>
+                    <div className="vc-plano-lista-fila">
+                      <span className="vc-plano-lista-fila-label">nº difusores:</span>
+                      <input
+                        type="number"
+                        step="1"
+                        min="0"
+                        value={s.emitters ?? 0}
+                        onChange={(e) => updateSector(s.id, { ...s, emitters: Number(e.target.value) })}
+                        className="vc-plano-input-sm"
+                      />
+                    </div>
+                    <div className="vc-plano-lista-fila">
+                      <span className="vc-plano-lista-fila-label">caudal/difusor:</span>
+                      <input
+                        type="number"
+                        step="1"
+                        min="0"
+                        value={s.emitterFlow ?? 0}
+                        onChange={(e) => updateSector(s.id, { ...s, emitterFlow: Number(e.target.value) })}
+                        className="vc-plano-input-sm"
+                      />
+                      <span className="vc-plano-lista-fila-unidad">L/h</span>
+                    </div>
+                    <div className="vc-plano-lista-fila">
+                      <span className="vc-plano-lista-fila-label">caudal total línea:</span>
+                      <span className="vc-plano-lista-fila-unidad">{Number(s.emitters || 0) * Number(s.emitterFlow || 0)} L/h</span>
+                    </div>
                   </div>
                 ))}
               </div>
 
-              <div className="vc-balance-hidrico">
-                <div className="vc-plano-header" style={{ marginBottom: 10 }}>
-                  <div>
-                    <div className="vc-history-title" style={{ marginBottom: 4 }}>Balance hídrico estimado</div>
-                    <p className="vc-tecnico-hint" style={{ margin: 0 }}>
-                      Compara el agua que realmente se ha regado hoy con la que las plantas necesitarían solo por
-                      evapotranspiración, calculada línea a línea según su superficie y su exposición real (sol,
-                      semisombra o sombra) — configúralas en la lista de arriba. La diferencia es una estimación de
-                      escorrentía o pérdida de agua (o de riego insuficiente, si sale negativa) — no un dato medido con
-                      sensores de humedad de suelo, así que tómalo como orientativo.
-                    </p>
-                  </div>
-                </div>
-                <div className="vc-field-row">
-                  <label>
-                    ETo sol pleno (L/m²/día)
-                    <input type="number" step="0.1" value={etoSol} onChange={(e) => setEtoSol(Number(e.target.value))} />
-                  </label>
-                  <label>
-                    ETo semisombra (L/m²/día)
-                    <input
-                      type="number"
-                      step="0.1"
-                      value={etoSemisombra}
-                      onChange={(e) => setEtoSemisombra(Number(e.target.value))}
-                    />
-                  </label>
-                  <label>
-                    ETo sombra (L/m²/día)
-                    <input type="number" step="0.1" value={etoSombra} onChange={(e) => setEtoSombra(Number(e.target.value))} />
-                  </label>
-                  <label>
-                    Umbral de aviso por línea (%)
-                    <input
-                      type="number"
-                      step="1"
-                      value={umbralBalanceHidrico}
-                      onChange={(e) => setUmbralBalanceHidrico(Number(e.target.value))}
-                    />
-                  </label>
-                </div>
-                <p className="vc-tecnico-hint">
-                  Este mismo cálculo se hace también línea a línea: si una línea concreta se desvía de su necesidad teórica más de
-                  este % (por exceso = posible escorrentía, o por defecto = posible riego insuficiente), aparecerá un aviso en su
-                  propia tarjeta, para identificar rápido cuál está mal ajustada. Se compara siempre con el día de AYER (ya
-                  completo), no con hoy — así no sale un falso aviso de déficit mientras el riego de hoy todavía está en marcha.
-                </p>
-                {(() => {
-                  const etoPorExposicion = { sol: etoSol, semisombra: etoSemisombra, sombra: etoSombra };
-                  const superficieTotal = sectors.reduce((sum, s) => sum + Number(s.areaM2 || 0), 0);
-                  const consumoTeorico =
-                    Math.round(
-                      sectors.reduce((sum, s) => sum + Number(s.areaM2 || 0) * (etoPorExposicion[s.exposicion] ?? etoSol), 0) * 10
-                    ) / 10;
-                  const consumosAyer = sectors.map((s) => consumoDeAyer(s, now));
-                  const hayDatosDeAyer = consumosAyer.some((v) => v !== null);
-                  const consumoReal = Math.round(consumosAyer.reduce((sum, v) => sum + (v || 0), 0) * 10) / 10;
-                  const diferencia = Math.round((consumoReal - consumoTeorico) * 10) / 10;
-                  if (!hayDatosDeAyer) {
-                    return (
-                      <div className="vc-balance-resultados">
-                        <div className="vc-balance-stat" style={{ gridColumn: "1 / -1" }}>
-                          <div className="vc-balance-stat-label">Todavía no hay un día completo de histórico — vuelve mañana</div>
-                        </div>
-                      </div>
-                    );
-                  }
-                  return (
-                    <div className="vc-balance-resultados">
-                      <div className="vc-balance-stat">
-                        <div className="vc-balance-stat-label">Superficie total ({superficieTotal.toFixed(1)} m²)</div>
-                        <div className="vc-balance-stat-value">{consumoTeorico} L</div>
-                        <div className="vc-balance-stat-label" style={{ marginTop: 2 }}>necesidad teórica / día</div>
-                      </div>
-                      <div className="vc-balance-stat">
-                        <div className="vc-balance-stat-label">Regado real AYER</div>
-                        <div className="vc-balance-stat-value">{consumoReal} L</div>
-                      </div>
-                      <div className="vc-balance-stat">
-                        <div className="vc-balance-stat-label">
-                          {diferencia >= 0 ? "Posible escorrentía" : "Posible déficit de riego"}
-                        </div>
-                        <div
-                          className="vc-balance-stat-value"
-                          style={{ color: diferencia >= 0 ? "var(--vc-amber)" : "var(--vc-red)" }}
-                        >
-                          {diferencia >= 0 ? "+" : ""}
-                          {diferencia} L
-                        </div>
-                      </div>
-                      <div className="vc-balance-stat vc-balance-stat-co2">
-                        <div className="vc-balance-stat-label">CO₂ estimado capturado / día</div>
-                        <div className="vc-balance-stat-value">{Math.round(((consumoReal * wueGramosPorLitro * 0.45 * 3.667) / 1000) * 100) / 100} kg</div>
-                      </div>
-                    </div>
-                  );
-                })()}
-                <div className="vc-field-row" style={{ marginTop: 12 }}>
-                  <label>
-                    Eficiencia hídrica de la vegetación — WUE (g materia seca / L agua)
-                    <input
-                      type="number"
-                      step="0.1"
-                      value={wueGramosPorLitro}
-                      onChange={(e) => setWueGramosPorLitro(Number(e.target.value))}
-                    />
-                  </label>
-                </div>
-                <p className="vc-tecnico-hint">
-                  ⚠ El CO₂ es una ESTIMACIÓN muy orientativa, no una medición certificable: se calcula asumiendo que el ~45% de la
-                  materia seca producida es carbono, y que cada gramo de carbono equivale a 3,67 g de CO₂. La eficiencia hídrica
-                  (WUE) real varía enormemente según la especie concreta de cada planta (de 1 a más de 10 g/L) — el valor de arriba
-                  es un promedio genérico de vegetación ornamental, ajústalo si conoces mejor las especies de tu instalación.
-                </p>
-              </div>
             </>
           )}
-          </div>
         </div>
       )}
 
-      {showListadoHorarios && (
-        <div className="vc-plano-overlay">
-          <div className="vc-plano-panel">
+      {pantallaActiva === "informe" && (
+        <div className="vc-pantalla-secundaria vc-informe-print">
+            <div className="vc-plano-header vc-informe-no-print">
+              <div>
+                <div className="vc-history-title" style={{ marginBottom: 4 }}>Informe de mantenimiento y firma</div>
+                <p className="vc-tecnico-hint" style={{ margin: 0 }}>
+                  Repasa los datos, firma con el dedo o el ratón en el recuadro, y guarda la firma. Luego usa "Imprimir /
+                  guardar como PDF" para generar el informe y compartirlo con el cliente desde el propio menú de
+                  compartir del móvil.
+                </p>
+              </div>
+              <div className="vc-plano-header-actions">
+                <button className="vc-cliente-copiar-btn" onClick={() => setPantallaActiva("ajustes")}>
+                  ✕ cerrar
+                </button>
+              </div>
+            </div>
+
+            <div className="vc-informe-encabezado">
+              <div className="vc-informe-titulo-empresa">Informe de mantenimiento — Verdtical Ecosistema S.L.</div>
+              <div className="vc-informe-fila">
+                <span>
+                  <strong>Proyecto:</strong> {proyecto.nombre || "sin definir"}
+                </span>
+                <span>
+                  <strong>Fecha:</strong> {now.toLocaleDateString("es-ES", { day: "2-digit", month: "long", year: "numeric" })}
+                </span>
+              </div>
+              <div className="vc-informe-fila">
+                <span>
+                  <strong>Técnico:</strong> {tecnico.nombre || "sin definir"}
+                </span>
+                <span>
+                  <strong>Cliente:</strong> {cliente.nombre || "sin definir"}
+                </span>
+              </div>
+            </div>
+
+            {(() => {
+              const ahora = new Date();
+              const mesActual = ahora.getMonth();
+              const anioActual = ahora.getFullYear();
+              const nombreMes = ahora.toLocaleDateString("es-ES", { month: "long" });
+              const lineasActivas = sectors.filter((s) => isSectorActiveNow(s, now)).length;
+              const lineasBloqueadas = sectors.filter((s) => s.blockedByLeak || s.blockedByFault);
+              const consumoPorLinea = sectors.map((s) => {
+                const diasDelMes = (s.dailyConsumption || []).filter((d) => {
+                  const fd = new Date(d.date);
+                  return fd.getMonth() === mesActual && fd.getFullYear() === anioActual;
+                });
+                const totalDias = diasDelMes.reduce((sum, d) => sum + Number(d.liters || 0), 0);
+                const total = Math.round((totalDias + Number(s.sensors?.litersToday || 0)) * 10) / 10;
+                return { nombre: s.name, litros: total };
+              });
+              const totalConsumoMes = Math.round(consumoPorLinea.reduce((sum, l) => sum + l.litros, 0) * 10) / 10;
+              const maxConsumoLinea = Math.max(1, ...consumoPorLinea.map((l) => l.litros));
+              const fertilizanteMes = (fertilizerDailyHistory || []).filter((d) => {
+                const fd = new Date(d.date);
+                return fd.getMonth() === mesActual && fd.getFullYear() === anioActual;
+              });
+              const totalFertilizanteMes =
+                Math.round(
+                  (fertilizanteMes.reduce((sum, d) => sum + Number(d.consumoML || 0), 0) + Number(fertilizerConsumedToday || 0)) * 10
+                ) / 10;
+              return (
+                <>
+                  <div className="vc-informe-resumen">
+                    <div className="vc-informe-resumen-stat">
+                      <div className="vc-informe-resumen-valor">{sectors.length}</div>
+                      <div className="vc-informe-resumen-label">líneas totales</div>
+                    </div>
+                    <div className="vc-informe-resumen-stat">
+                      <div className="vc-informe-resumen-valor">{lineasActivas}</div>
+                      <div className="vc-informe-resumen-label">regando ahora</div>
+                    </div>
+                    <div className="vc-informe-resumen-stat">
+                      <div className="vc-informe-resumen-valor">{pressureBar} bar</div>
+                      <div className="vc-informe-resumen-label">presión de red</div>
+                    </div>
+                    <div className="vc-informe-resumen-stat">
+                      <div className="vc-informe-resumen-valor" style={{ color: fertilizerLevel < 15 ? "#c0392b" : undefined }}>
+                        {fertilizerLevel}%
+                      </div>
+                      <div className="vc-informe-resumen-label">depósito fertilizante</div>
+                    </div>
+                  </div>
+                  <div className="vc-informe-incidencias">
+                    {lineasBloqueadas.length === 0
+                      ? "✓ Sin incidencias abiertas en el momento del informe."
+                      : `⚠ Líneas con incidencia abierta ahora mismo: ${lineasBloqueadas.map((s) => s.name).join(", ")}.`}
+                  </div>
+
+                  <div className="vc-history-title" style={{ marginTop: 14, marginBottom: 6 }}>
+                    Consumo de agua de {nombreMes} — {totalConsumoMes} L en total
+                  </div>
+                  <div className="vc-informe-consumo-tabla">
+                    {consumoPorLinea.map((l) => (
+                      <div className="vc-informe-consumo-fila" key={l.nombre}>
+                        <span className="vc-informe-consumo-nombre">{l.nombre}</span>
+                        <div className="vc-informe-consumo-barra-wrap">
+                          <div
+                            className="vc-informe-consumo-barra"
+                            style={{ width: `${Math.max(4, (l.litros / maxConsumoLinea) * 100)}%` }}
+                          />
+                        </div>
+                        <span className="vc-informe-consumo-valor">{l.litros} L</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="vc-informe-fertilizante">
+                    Fertilizante consumido en {nombreMes}: <strong>{totalFertilizanteMes} mL</strong>
+                  </div>
+                </>
+              );
+            })()}
+
+            <div className="vc-history-title vc-informe-no-print" style={{ marginTop: 14, marginBottom: 4 }}>Procesos realizados en esta visita</div>
+            <div className="vc-tecnico-checks vc-informe-no-print">
+              {CATALOGO_PROCESOS_MANTENIMIENTO.map((p) => (
+                <label className="vc-tecnico-check" key={p.key}>
+                  <input
+                    type="checkbox"
+                    checked={procesosRealizados[p.key] === true}
+                    onChange={(e) => setProcesosRealizados({ ...procesosRealizados, [p.key]: e.target.checked })}
+                  />
+                  {p.label}
+                </label>
+              ))}
+            </div>
+            <div className="vc-informe-procesos vc-informe-solo-print">
+              {CATALOGO_PROCESOS_MANTENIMIENTO.filter((p) => procesosRealizados[p.key]).length === 0 ? (
+                <div className="vc-history-empty">no se ha marcado ningún proceso</div>
+              ) : (
+                CATALOGO_PROCESOS_MANTENIMIENTO.filter((p) => procesosRealizados[p.key]).map((p) => (
+                  <div key={p.key}>✓ {p.label}</div>
+                ))
+              )}
+            </div>
+
+            <label className="vc-tecnico-field vc-informe-no-print" style={{ marginTop: 8 }}>
+              Nota de observación
+              <textarea
+                rows={2}
+                value={notaObservacion}
+                onChange={(e) => setNotaObservacion(e.target.value)}
+                placeholder="Comentarios, incidencias vistas in situ, recomendaciones…"
+              />
+            </label>
+            {notaObservacion && (
+              <>
+                <div className="vc-history-title vc-informe-solo-print" style={{ marginTop: 14, marginBottom: 4 }}>Observaciones</div>
+                <p className="vc-tecnico-hint vc-informe-solo-print" style={{ marginTop: 0 }}>{notaObservacion}</p>
+              </>
+            )}
+            {cliente.email ? (
+              <a
+                className="vc-cliente-informe-btn vc-informe-no-print"
+                href={enviarInformeMantenimientoCliente()}
+                style={{ textDecoration: "none", display: "inline-block", textAlign: "center" }}
+              >
+                ✉ enviar informe de mantenimiento ahora
+              </a>
+            ) : (
+              <button className="vc-cliente-informe-btn vc-informe-no-print" disabled>
+                ✉ enviar informe de mantenimiento ahora
+              </button>
+            )}
+            {!cliente.email && (
+              <p className="vc-tecnico-hint vc-informe-no-print" style={{ margin: 0 }}>
+                añade un email al cliente (en el botón Cliente) para poder enviarlo
+              </p>
+            )}
+
+            <div className="vc-history-title" style={{ marginTop: 14, marginBottom: 4 }}>Firma del técnico</div>
+            <div className="vc-firma-wrap">
+              <canvas
+                ref={firmaCanvasRef}
+                width={500}
+                height={200}
+                className="vc-firma-canvas"
+                onMouseDown={firmaEmpezarTrazo}
+                onMouseMove={firmaContinuarTrazo}
+                onMouseUp={firmaTerminarTrazo}
+                onMouseLeave={firmaTerminarTrazo}
+                onTouchStart={firmaEmpezarTrazo}
+                onTouchMove={firmaContinuarTrazo}
+                onTouchEnd={firmaTerminarTrazo}
+              />
+            </div>
+            <div className="vc-informe-no-print vc-firma-botones">
+              <button className="vc-toggle-btn" onClick={firmaBorrar}>
+                🗑 borrar firma
+              </button>
+              <button className="vc-toggle-btn vc-firma-guardar-btn" onClick={firmaGuardar}>
+                ✓ guardar firma
+              </button>
+              <button className="vc-toggle-btn vc-firma-guardar-btn" onClick={() => window.print()}>
+                🖨️ imprimir / guardar como PDF
+              </button>
+            </div>
+            {firmaFecha && (
+              <p className="vc-tecnico-hint" style={{ marginTop: 8 }}>
+                Firmado el {new Date(firmaFecha).toLocaleString("es-ES")}
+              </p>
+            )}
+        </div>
+      )}
+
+      {pantallaActiva === "listado" && (
+        <div className="vc-pantalla-secundaria">
             <div className="vc-plano-header">
               <div>
                 <div className="vc-history-title" style={{ marginBottom: 4 }}>Listado de horarios — todas las líneas</div>
@@ -6851,7 +9174,7 @@ export default function VerdticalControlPanel() {
                   otra línea (mismo día, misma franja). Debajo, los huecos del día en los que ninguna línea está regando.
                 </p>
               </div>
-              <button className="vc-plano-cerrar-btn" onClick={() => setShowListadoHorarios(false)}>
+              <button className="vc-plano-cerrar-btn" onClick={() => setPantallaActiva("programacion")}>
                 ✕ cerrar
               </button>
             </div>
@@ -6944,12 +9267,11 @@ export default function VerdticalControlPanel() {
                 </>
               );
             })()}
-          </div>
         </div>
       )}
 
       <div className="vc-grid">
-        {sectors.map((s) => {
+        {pantallaActiva === "lineas" && sectors.map((s) => {
           const etoLinea = { sol: etoSol, semisombra: etoSemisombra, sombra: etoSombra }[s.exposicion] ?? etoSol;
           const necesidadTeorica = Math.round(Number(s.areaM2 || 0) * etoLinea * 10) / 10;
           const consumoAyerLinea = consumoDeAyer(s, now);
@@ -6979,6 +9301,7 @@ export default function VerdticalControlPanel() {
               etoSol={etoSol}
               etoSemisombra={etoSemisombra}
               etoSombra={etoSombra}
+              factoresEstacionales={factoresEstacionales}
               alarmHistory={alarmHistory}
               onUpdate={(updated) => updateSector(s.id, updated)}
               onRemove={() => removeSector(s.id)}
@@ -6987,10 +9310,44 @@ export default function VerdticalControlPanel() {
             />
           );
         })}
-        <button className="vc-add-card" onClick={addSector}>
-          + añadir línea
-        </button>
+        {pantallaActiva === "lineas" && (
+          <button className="vc-add-card" onClick={addSector}>
+            + añadir línea
+          </button>
+        )}
       </div>
+
+      <div className="vc-tabbar-spacer" />
+      <nav className="vc-tabbar">
+        <button
+          className={pantallaActiva === "lineas" ? "vc-tabbar-btn vc-tabbar-btn-on" : "vc-tabbar-btn"}
+          onClick={() => setPantallaActiva("lineas")}
+        >
+          <span className="vc-tabbar-icon">💧</span>
+          <span>Líneas</span>
+        </button>
+        <button
+          className={pantallaActiva === "plano" ? "vc-tabbar-btn vc-tabbar-btn-on" : "vc-tabbar-btn"}
+          onClick={() => setPantallaActiva("plano")}
+        >
+          <span className="vc-tabbar-icon">🗺️</span>
+          <span>Plano</span>
+        </button>
+        <button
+          className={pantallaActiva === "programacion" ? "vc-tabbar-btn vc-tabbar-btn-on" : "vc-tabbar-btn"}
+          onClick={() => setPantallaActiva("programacion")}
+        >
+          <span className="vc-tabbar-icon">📅</span>
+          <span>Programación</span>
+        </button>
+        <button
+          className={pantallaActiva === "ajustes" ? "vc-tabbar-btn vc-tabbar-btn-on" : "vc-tabbar-btn"}
+          onClick={() => setPantallaActiva("ajustes")}
+        >
+          <span className="vc-tabbar-icon">⚙️</span>
+          <span>Ajustes</span>
+        </button>
+      </nav>
     </div>
   );
 }
