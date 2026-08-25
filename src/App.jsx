@@ -1,6 +1,11 @@
 import React, { useState, useEffect, useRef } from "react";
 import { LineChart, Line, BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Legend } from "recharts";
-import { obtenerUltimasLecturas, buscarLectura } from "./apiClient";
+import {
+  obtenerUltimasLecturas,
+  buscarLectura,
+  obtenerBootstrapProyecto,
+  buscarLineaBackend,
+} from "./apiClient";
 
 const DIAS = [
   { key: "L", label: "Lun" },
@@ -295,6 +300,32 @@ function sanearLineasAlCargar(sectors) {
       temperatureFlag: false,
     };
   });
+}
+
+// Rellena en un sector, campo a campo y solo donde falte localmente, los
+// umbrales/posición en el plano que trae la línea correspondiente del
+// backend. Nunca sobreescribe un valor que el sector ya tenga (localStorage
+// manda siempre — ver Fase 2 del plan de unificación).
+function fusionarLineaConBackend(s, l) {
+  if (!l) return s;
+  const th = s.thresholds || {};
+  return {
+    ...s,
+    thresholds: {
+      ...th,
+      humidityMin: th.humidityMin ?? l.umbral_humedad_min ?? undefined,
+      humidityMax: th.humidityMax ?? l.umbral_humedad_max ?? undefined,
+      ecMin: th.ecMin ?? l.umbral_ec_min ?? undefined,
+      ecMax: th.ecMax ?? l.umbral_ec_max ?? undefined,
+      temperatureMin: th.temperatureMin ?? l.umbral_temperatura_min ?? undefined,
+      temperatureMax: th.temperatureMax ?? l.umbral_temperatura_max ?? undefined,
+      flowMinPercent: th.flowMinPercent ?? l.umbral_caudal_min_pct ?? undefined,
+      flowMaxPercent: th.flowMaxPercent ?? l.umbral_caudal_max_pct ?? undefined,
+    },
+    posicionPlano: s.posicionPlano ?? (l.plano_pos_x != null ? { x: l.plano_pos_x, y: l.plano_pos_y } : undefined),
+    areaM2: s.areaM2 ?? l.superficie_m2 ?? undefined,
+    exposicion: s.exposicion ?? l.exposicion ?? undefined,
+  };
 }
 
 function demoHumedadSemana(humedadBase) {
@@ -2866,12 +2897,25 @@ export default function VerdticalControlPanel() {
     let mounted = true;
     (async () => {
       try {
-        const result = await window.storage.get(STORAGE_KEY);
+        const [result, backend] = await Promise.all([
+          window.storage.get(STORAGE_KEY),
+          obtenerBootstrapProyecto(),
+        ]);
+        const b = backend?.proyecto || {};
+        const lineasBackend = backend?.lineas || null;
+        const fusionarConBackend = (sectores) =>
+          lineasBackend
+            ? sectores.map((s, i) => fusionarLineaConBackend(s, buscarLineaBackend(lineasBackend, s.name, i)))
+            : sectores;
         if (mounted && result && result.value) {
           const parsed = JSON.parse(result.value);
-          setSectors(sanearLineasAlCargar(parsed.sectors) || defaultSectors());
+          // localStorage manda siempre; el backend solo rellena huecos (ver
+          // Fase 2 del plan de unificación) — nunca pisa un valor ya guardado.
+          const v = (campoLocal, campoBackend, def) =>
+            parsed[campoLocal] !== undefined ? parsed[campoLocal] : b[campoBackend] ?? def;
+          setSectors(fusionarConBackend(sanearLineasAlCargar(parsed.sectors) || defaultSectors()));
           setMainSupply(parsed.mainSupply !== undefined ? parsed.mainSupply : true);
-          setPressureBar(parsed.pressureBar !== undefined ? parsed.pressureBar : 2.6);
+          setPressureBar(v("pressureBar", "presion_bar", 2.6));
           setHistory(parsed.history || []);
           setFlowHistory(parsed.flowHistory || []);
           setPressureHistory(parsed.pressureHistory || []);
@@ -2880,12 +2924,20 @@ export default function VerdticalControlPanel() {
           setMaestraCerrada(parsed.maestraCerrada ?? null);
           setLeakAlerts(parsed.leakAlerts || []);
           setAlarmHistory(parsed.alarmHistory || []);
+          const tecnicoBackend = backend?.contactos?.tecnico;
           setTecnico({
             nombre: "",
             telefono: "",
             email: "",
             emailAvisos: "",
-            alarmas: { fugas: true, fallo_electrico: true, embozo: true, presion: true, humedad: true, ec: true, temperatura: true, multiples_lineas: true, fertilizante: true, maestra: true, corte_corriente: true, sin_datos: true, sin_agua: true },
+            ...(tecnicoBackend
+              ? {
+                  nombre: tecnicoBackend.nombre || "",
+                  telefono: tecnicoBackend.telefono || "",
+                  email: tecnicoBackend.email || "",
+                  emailAvisos: tecnicoBackend.email_avisos || "",
+                }
+              : {}),
             ...(parsed.tecnico || {}),
             alarmas: {
               fugas: true,
@@ -2897,15 +2949,28 @@ export default function VerdticalControlPanel() {
               temperatura: true,
               multiples_lineas: true,
               fertilizante: true,
+              maestra: true,
+              corte_corriente: true,
+              sin_datos: true,
+              sin_agua: true,
+              ...(tecnicoBackend?.alarmas || {}),
               ...(parsed.tecnico && parsed.tecnico.alarmas ? parsed.tecnico.alarmas : {}),
             },
           });
+          const clienteBackend = backend?.contactos?.cliente;
           setCliente({
             nombre: "",
             telefono: "",
             email: "",
             emailAvisos: "",
-            alarmas: { fugas: false, fallo_electrico: false, embozo: false, presion: false, humedad: false, ec: false, temperatura: false, multiples_lineas: false, fertilizante: false, maestra: false, corte_corriente: false, sin_datos: false, sin_agua: false },
+            ...(clienteBackend
+              ? {
+                  nombre: clienteBackend.nombre || "",
+                  telefono: clienteBackend.telefono || "",
+                  email: clienteBackend.email || "",
+                  emailAvisos: clienteBackend.email_avisos || "",
+                }
+              : {}),
             ...(parsed.cliente || {}),
             alarmas: {
               fugas: false,
@@ -2917,19 +2982,29 @@ export default function VerdticalControlPanel() {
               temperatura: false,
               multiples_lineas: false,
               fertilizante: false,
+              maestra: false,
+              corte_corriente: false,
+              sin_datos: false,
+              sin_agua: false,
+              ...(clienteBackend?.alarmas || {}),
               ...(parsed.cliente && parsed.cliente.alarmas ? parsed.cliente.alarmas : {}),
             },
           });
           setProcesosRealizados(parsed.procesosRealizados || {});
-          setPlanoImagen(parsed.planoImagen || PLANO_DEMO_IMAGEN);
-          setEtoSol(parsed.etoSol ?? 7);
-          setEtoSemisombra(parsed.etoSemisombra ?? 4.75);
-          setEtoSombra(parsed.etoSombra ?? 2.5);
+          setPlanoImagen(parsed.planoImagen || backend?.plano?.imagen || PLANO_DEMO_IMAGEN);
+          setEtoSol(v("etoSol", "eto_sol", 7));
+          setEtoSemisombra(v("etoSemisombra", "eto_semisombra", 4.75));
+          setEtoSombra(v("etoSombra", "eto_sombra", 2.5));
           setFactoresEstacionales(
-            parsed.factoresEstacionales || { primavera: 0.75, verano: 1, otono: 0.55, invierno: 0.3 }
+            parsed.factoresEstacionales || {
+              primavera: b.factor_primavera ?? 0.75,
+              verano: b.factor_verano ?? 1,
+              otono: b.factor_otono ?? 0.55,
+              invierno: b.factor_invierno ?? 0.3,
+            }
           );
-          setUmbralBalanceHidrico(parsed.umbralBalanceHidrico ?? 30);
-          setWueGramosPorLitro(parsed.wueGramosPorLitro ?? 2.5);
+          setUmbralBalanceHidrico(v("umbralBalanceHidrico", "umbral_balance_hidrico", 30));
+          setWueGramosPorLitro(v("wueGramosPorLitro", "wue_gramos_por_litro", 2.5));
           setNotaObservacion(parsed.notaObservacion || "");
           setProyecto(parsed.proyecto || { id: "", nombre: "" });
           setPressureAlert(parsed.pressureAlert || null);
@@ -2946,34 +3021,28 @@ export default function VerdticalControlPanel() {
             Array.isArray(parsed.fertilizerHourlyConsumption) ? parsed.fertilizerHourlyConsumption : Array(24).fill(0)
           );
           setFertilizerHourlyHistory(parsed.fertilizerHourlyHistory || []);
-          setFertilizerTanqueL(parsed.fertilizerTanqueL !== undefined ? parsed.fertilizerTanqueL : 20);
-          setFertilizerDosisMlPorLitro(parsed.fertilizerDosisMlPorLitro !== undefined ? parsed.fertilizerDosisMlPorLitro : 1);
-          setPresionSinAgua(parsed.presionSinAgua !== undefined ? parsed.presionSinAgua : 0.5);
-          setPresionBaja(parsed.presionBaja !== undefined ? parsed.presionBaja : 1.8);
-          setPresionAlta(parsed.presionAlta !== undefined ? parsed.presionAlta : 4.0);
-          setPresionEscalaMax(parsed.presionEscalaMax !== undefined ? parsed.presionEscalaMax : 6);
-          setPresionHorasSinAgua(parsed.presionHorasSinAgua !== undefined ? parsed.presionHorasSinAgua : 1);
-          setPresionHorasBaja(parsed.presionHorasBaja !== undefined ? parsed.presionHorasBaja : 6);
-          setPresionHorasAlta(parsed.presionHorasAlta !== undefined ? parsed.presionHorasAlta : 6);
-          setFertilizanteUmbralBajo(parsed.fertilizanteUmbralBajo !== undefined ? parsed.fertilizanteUmbralBajo : 15);
-          setFertilizanteUmbralAgotado(parsed.fertilizanteUmbralAgotado !== undefined ? parsed.fertilizanteUmbralAgotado : 5);
-          setMultiplesLineasUmbral(parsed.multiplesLineasUmbral !== undefined ? parsed.multiplesLineasUmbral : 3);
-          setFertilizanteHorasSostenidas(parsed.fertilizanteHorasSostenidas !== undefined ? parsed.fertilizanteHorasSostenidas : 1);
-          setMultiplesLineasHorasSostenidas(
-            parsed.multiplesLineasHorasSostenidas !== undefined ? parsed.multiplesLineasHorasSostenidas : 0.5
-          );
+          setFertilizerTanqueL(v("fertilizerTanqueL", "fertilizante_tanque_l", 20));
+          setFertilizerDosisMlPorLitro(v("fertilizerDosisMlPorLitro", "fertilizante_dosis_ml_por_litro", 1));
+          setPresionSinAgua(v("presionSinAgua", "presion_sin_agua", 0.5));
+          setPresionBaja(v("presionBaja", "presion_baja", 1.8));
+          setPresionAlta(v("presionAlta", "presion_alta", 4.0));
+          setPresionEscalaMax(v("presionEscalaMax", "presion_escala_max", 6));
+          setPresionHorasSinAgua(v("presionHorasSinAgua", "presion_horas_sin_agua", 1));
+          setPresionHorasBaja(v("presionHorasBaja", "presion_horas_baja", 6));
+          setPresionHorasAlta(v("presionHorasAlta", "presion_horas_alta", 6));
+          setFertilizanteUmbralBajo(v("fertilizanteUmbralBajo", "fertilizante_umbral_bajo", 15));
+          setFertilizanteUmbralAgotado(v("fertilizanteUmbralAgotado", "fertilizante_umbral_agotado", 5));
+          setMultiplesLineasUmbral(v("multiplesLineasUmbral", "multiples_lineas_umbral", 3));
+          setFertilizanteHorasSostenidas(v("fertilizanteHorasSostenidas", "fertilizante_horas_sostenidas", 1));
+          setMultiplesLineasHorasSostenidas(v("multiplesLineasHorasSostenidas", "multiples_lineas_horas_sostenidas", 0.5));
           setBateriaPlcNivel(parsed.bateriaPlcNivel !== undefined ? parsed.bateriaPlcNivel : 100);
-          setBateriaUmbralBaja(parsed.bateriaUmbralBaja !== undefined ? parsed.bateriaUmbralBaja : 20);
-          setBateriaAutonomiaHoras(parsed.bateriaAutonomiaHoras !== undefined ? parsed.bateriaAutonomiaHoras : 4);
-          setRoturaColectorLitrosHora(parsed.roturaColectorLitrosHora !== undefined ? parsed.roturaColectorLitrosHora : 5);
-          setRoturaColectorHorasSostenidas(
-            parsed.roturaColectorHorasSostenidas !== undefined ? parsed.roturaColectorHorasSostenidas : 0.03
-          );
-          setCorteCorrienteHorasSostenidas(
-            parsed.corteCorrienteHorasSostenidas !== undefined ? parsed.corteCorrienteHorasSostenidas : 0
-          );
-          setFugaLeveHorasSostenidas(parsed.fugaLeveHorasSostenidas !== undefined ? parsed.fugaLeveHorasSostenidas : 0.5);
-          setEmbozoHorasSostenidas(parsed.embozoHorasSostenidas !== undefined ? parsed.embozoHorasSostenidas : 0.5);
+          setBateriaUmbralBaja(v("bateriaUmbralBaja", "bateria_umbral_baja", 20));
+          setBateriaAutonomiaHoras(v("bateriaAutonomiaHoras", "bateria_autonomia_horas", 4));
+          setRoturaColectorLitrosHora(v("roturaColectorLitrosHora", "rotura_colector_litros_hora", 5));
+          setRoturaColectorHorasSostenidas(v("roturaColectorHorasSostenidas", "rotura_colector_horas_sostenidas", 0.03));
+          setCorteCorrienteHorasSostenidas(v("corteCorrienteHorasSostenidas", "corte_corriente_horas_sostenidas", 0));
+          setFugaLeveHorasSostenidas(v("fugaLeveHorasSostenidas", "fuga_leve_horas_sostenidas", 0.5));
+          setEmbozoHorasSostenidas(v("embozoHorasSostenidas", "embozo_horas_sostenidas", 0.5));
           bateriaBajaAlertadaRef.current = parsed.bateriaBajaAlertada || false;
           setFirmaDataUrl(parsed.firmaDataUrl || null);
           setFirmaFecha(parsed.firmaFecha || null);
@@ -2990,11 +3059,73 @@ export default function VerdticalControlPanel() {
           setPressureOutageLog(parsed.pressureOutageLog || []);
           setPressureHourlyHistory(parsed.pressureHourlyHistory || demoPressureHourly());
         } else if (mounted) {
-          setSectors(defaultSectors());
+          // Sin nada en localStorage (navegador/dispositivo nuevo): el
+          // backend es la única fuente de configuración real disponible.
+          setSectors(fusionarConBackend(defaultSectors()));
           setDailyConsumption(demoDailyConsumption());
           setFertilizerDailyHistory(demoFertilizerHistory());
           setPressureDailyHistory(demoPressureHistory());
           setPressureHourlyHistory(demoPressureHourly());
+          if (backend?.proyecto) {
+            setPressureBar(b.presion_bar ?? 2.6);
+            setEtoSol(b.eto_sol ?? 7);
+            setEtoSemisombra(b.eto_semisombra ?? 4.75);
+            setEtoSombra(b.eto_sombra ?? 2.5);
+            setFactoresEstacionales({
+              primavera: b.factor_primavera ?? 0.75,
+              verano: b.factor_verano ?? 1,
+              otono: b.factor_otono ?? 0.55,
+              invierno: b.factor_invierno ?? 0.3,
+            });
+            setUmbralBalanceHidrico(b.umbral_balance_hidrico ?? 30);
+            setWueGramosPorLitro(b.wue_gramos_por_litro ?? 2.5);
+            setFertilizerTanqueL(b.fertilizante_tanque_l ?? 20);
+            setFertilizerDosisMlPorLitro(b.fertilizante_dosis_ml_por_litro ?? 1);
+            setPresionSinAgua(b.presion_sin_agua ?? 0.5);
+            setPresionBaja(b.presion_baja ?? 1.8);
+            setPresionAlta(b.presion_alta ?? 4.0);
+            setPresionEscalaMax(b.presion_escala_max ?? 6);
+            setPresionHorasSinAgua(b.presion_horas_sin_agua ?? 1);
+            setPresionHorasBaja(b.presion_horas_baja ?? 6);
+            setPresionHorasAlta(b.presion_horas_alta ?? 6);
+            setFertilizanteUmbralBajo(b.fertilizante_umbral_bajo ?? 15);
+            setFertilizanteUmbralAgotado(b.fertilizante_umbral_agotado ?? 5);
+            setMultiplesLineasUmbral(b.multiples_lineas_umbral ?? 3);
+            setFertilizanteHorasSostenidas(b.fertilizante_horas_sostenidas ?? 1);
+            setMultiplesLineasHorasSostenidas(b.multiples_lineas_horas_sostenidas ?? 0.5);
+            setBateriaUmbralBaja(b.bateria_umbral_baja ?? 20);
+            setBateriaAutonomiaHoras(b.bateria_autonomia_horas ?? 4);
+            setRoturaColectorLitrosHora(b.rotura_colector_litros_hora ?? 5);
+            setRoturaColectorHorasSostenidas(b.rotura_colector_horas_sostenidas ?? 0.03);
+            setCorteCorrienteHorasSostenidas(b.corte_corriente_horas_sostenidas ?? 0);
+            setFugaLeveHorasSostenidas(b.fuga_leve_horas_sostenidas ?? 0.5);
+            setEmbozoHorasSostenidas(b.embozo_horas_sostenidas ?? 0.5);
+          }
+          if (backend?.contactos?.tecnico) {
+            const t = backend.contactos.tecnico;
+            setTecnico((prev) => ({
+              ...prev,
+              nombre: t.nombre || prev.nombre,
+              telefono: t.telefono || prev.telefono,
+              email: t.email || prev.email,
+              emailAvisos: t.email_avisos || prev.emailAvisos,
+              alarmas: { ...prev.alarmas, ...(t.alarmas || {}) },
+            }));
+          }
+          if (backend?.contactos?.cliente) {
+            const c = backend.contactos.cliente;
+            setCliente((prev) => ({
+              ...prev,
+              nombre: c.nombre || prev.nombre,
+              telefono: c.telefono || prev.telefono,
+              email: c.email || prev.email,
+              emailAvisos: c.email_avisos || prev.emailAvisos,
+              alarmas: { ...prev.alarmas, ...(c.alarmas || {}) },
+            }));
+          }
+          if (backend?.plano?.imagen) {
+            setPlanoImagen(backend.plano.imagen);
+          }
         }
       } catch (err) {
         if (mounted) setSectors(defaultSectors());
@@ -4392,7 +4523,7 @@ export default function VerdticalControlPanel() {
     if (!cliente.email) return null;
     const { subject, body } = construirTextoInformeMantenimiento();
     const destino = cliente.emailAvisos || cliente.email;
-    return `mailto:${destino}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    return `mailto:${encodeURIComponent(destino)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
   };
 
   const enviarInformeMantenimientoWhatsapp = () => {
